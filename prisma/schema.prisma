@@ -63,18 +63,56 @@ model Node {
 /// keeps the full array. Builder-form fields (systemPrompt etc.) stay
 /// server-side until Phase 4 adds the builder endpoints.
 model Agent {
-  id            String  @id
-  name          String
-  initial       String
-  description   String  @default("")
-  model         String
-  temperature   Float   @default(0.5)
-  topP          Float   @default(1.0) @map("top_p")
-  maxTokens     Int     @default(4096) @map("max_tokens")
-  systemPrompt  String  @default("") @map("system_prompt")
-  toolIds       Json    @default("[]") @map("tool_ids")
+  id                String  @id
+  name              String
+  initial           String
+  description       String  @default("")
+  model             String
+  temperature       Float   @default(0.5)
+  topP              Float   @default(1.0) @map("top_p")
+  maxTokens         Int     @default(4096) @map("max_tokens")
+  systemPrompt      String  @default("") @map("system_prompt")
+  toolIds           Json    @default("[]") @map("tool_ids")
+  /// Phase 2: one of 'ask_every_time' | 'auto_allow_read' | 'auto_allow_all'.
+  /// Drives whether a tool call needs an approval round-trip.
+  permissionDefault String  @default("ask_every_time") @map("permission_default")
 
   @@map("agents")
+}
+
+/// Phase 2: one row per proposed tool call that needs user approval.
+/// The conversation is paused until `decision` is set; the runtime
+/// awaits a POST /approvals/:id/decide call that fills this in and
+/// resolves the pending promise.
+model Approval {
+  id             String    @id
+  conversationId String    @map("conversation_id")
+  nodeId         String    @map("node_id")
+  tool           String
+  title          String
+  body           String
+  preview        String?
+  decision       String?
+  decidedAt      DateTime? @map("decided_at")
+  /// When decision='always', this is the key stored in ApprovalGrant so
+  /// future calls skip approval entirely.
+  rememberKey    String?   @map("remember_key")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([conversationId])
+  @@map("approvals")
+}
+
+/// Phase 2: persistent "allow always" grants keyed by (user, agent, tool).
+/// userId is hardcoded 'local' until the multi-user phase lands.
+model ApprovalGrant {
+  userId    String   @map("user_id")
+  agentId   String   @map("agent_id")
+  toolId    String   @map("tool_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([userId, agentId, toolId])
+  @@map("approval_grants")
 }
 
 /// Every BusEvent persisted before publication, so the SSE stream can

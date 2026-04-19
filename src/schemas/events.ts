@@ -1,5 +1,12 @@
 import { z } from 'zod';
-import { MessageNodeSchema, StatusStateSchema, ToolCallDataSchema, ToolStatusSchema } from './node.js';
+import {
+  ApprovalDataSchema,
+  DecisionSchema,
+  MessageNodeSchema,
+  StatusStateSchema,
+  ToolCallDataSchema,
+  ToolStatusSchema,
+} from './node.js';
 
 const Base = z.object({
   id: z.string(),
@@ -73,6 +80,20 @@ export const ActiveLeafChangedEventSchema = Base.extend({
   active_leaf_id: z.string(),
 });
 
+export const ApprovalRequestedEventSchema = Base.extend({
+  kind: z.literal('approval.requested'),
+  node_id: z.string(),
+  approval_id: z.string(),
+  approval: ApprovalDataSchema,
+});
+
+export const ApprovalDecidedEventSchema = Base.extend({
+  kind: z.literal('approval.decided'),
+  node_id: z.string(),
+  approval_id: z.string(),
+  decision: DecisionSchema,
+});
+
 export const ErrorEventSchema = Base.extend({
   kind: z.literal('error'),
   node_id: z.string().optional(),
@@ -89,6 +110,8 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ToolCallProposedEventSchema,
   ToolCallStartedEventSchema,
   ToolCallEndedEventSchema,
+  ApprovalRequestedEventSchema,
+  ApprovalDecidedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,

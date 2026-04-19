@@ -15,6 +15,16 @@ export const StatusStateSchema = z.enum([
 ]);
 export type StatusState = z.infer<typeof StatusStateSchema>;
 
+export const DecisionSchema = z.enum(['allow', 'always', 'deny']);
+export type Decision = z.infer<typeof DecisionSchema>;
+
+export const PermissionDefaultSchema = z.enum([
+  'ask_every_time',
+  'auto_allow_read',
+  'auto_allow_all',
+]);
+export type PermissionDefault = z.infer<typeof PermissionDefaultSchema>;
+
 export const ToolCallDataSchema = z.object({
   name: z.string(),
   args: z.record(z.string(), z.unknown()),
