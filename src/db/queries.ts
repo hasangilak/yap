@@ -109,6 +109,7 @@ type ConvRow = {
   activeLeafId: string | null;
   tokenBudget: number;
   tokensUsed: number;
+  shareToken: string | null;
 };
 
 function convRowToWire(row: ConvRow, agentName: string): Conversation {
