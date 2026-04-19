@@ -9,8 +9,10 @@ import { devRouter } from './dev.js';
 import { messagesRouter } from './messages.js';
 import { nodesRouter } from './nodes.js';
 import { notesRouter } from './notes.js';
+import { searchRouter } from './search.js';
 import { streamRouter } from './stream.js';
 import { tagsRouter } from './tags.js';
+import { timelineRouter } from './timeline.js';
 import { toolsRouter } from './tools.js';
 
 export const apiV1 = new Hono();
@@ -20,6 +22,8 @@ export const apiV1 = new Hono();
 apiV1.route('/', messagesRouter);
 apiV1.route('/', streamRouter);
 apiV1.route('/', notesRouter);
+apiV1.route('/', timelineRouter);
+apiV1.route('/search', searchRouter);
 
 apiV1.route('/conversations', conversationsRouter);
 apiV1.route('/agents', agentsRouter);
