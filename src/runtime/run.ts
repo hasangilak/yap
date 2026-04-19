@@ -24,6 +24,20 @@ import type {
   ToolCallData,
 } from '../schemas/index.js';
 
+const ollama = new Ollama({ host: config.ollamaHost });
+
+function newNodeId(): string {
+  return `n-${randomUUID().slice(0, 8)}`;
+}
+
+function envelope(conversation_id: string): { id: string; at: number; conversation_id: string } {
+  return { id: newEventId(), at: Date.now(), conversation_id };
+}
+
+interface OllamaToolCall {
+  function: { name: string; arguments: Record<string, unknown> };
+}
+
 /**
  * Approval decision under the three-layer model in docs/server-spec.md §6:
  * session grant → agent permission_default → agent-level tool auto flag.
@@ -33,16 +47,9 @@ import type {
  */
 async function isAutoApproved(agentId: string, toolName: string): Promise<boolean> {
   if (await hasGrant(agentId, toolName)) return true;
-
   const perm = await getAgentPermission(agentId);
   if (perm === 'auto_allow_all') return true;
-
-  // Side-effect tools always need approval unless the agent is set to
-  // auto_allow_all (handled above) or a grant exists.
   if (isSideEffectful(toolName)) return false;
-
-  // Non-side-effect tools: auto_allow_read blanket-approves them, and
-  // the tool's own auto flag covers the default case (e.g. web_search).
   if (perm === 'auto_allow_read') return true;
   const toolDef = TOOL_DEFS.find((t) => t.id === toolName);
   return toolDef?.auto === true;
@@ -55,41 +62,15 @@ function approvalPayloadFor(toolName: string, args: Record<string, unknown>): Ap
     const compact = JSON.stringify(args);
     return compact.length > 200 ? compact.slice(0, 197) + '...' : compact;
   })();
-  return {
-    tool: toolName,
-    title: `Run ${toolName}`,
-    body: desc,
-    preview,
-  };
+  return { tool: toolName, title: `Run ${toolName}`, body: desc, preview };
 }
 
-const ollama = new Ollama({ host: config.ollamaHost });
-
-function newNodeId(prefix: 'n' | 'u' | 'a' = 'n'): string {
-  return `${prefix}-${randomUUID().slice(0, 8)}`;
-}
-
-function envelope(conversation_id: string): { id: string; at: number; conversation_id: string } {
-  return { id: newEventId(), at: Date.now(), conversation_id };
-}
-
-interface OllamaToolCall {
-  function: { name: string; arguments: Record<string, unknown> };
-}
+// -- public entry points -----------------------------------------------------
 
 /**
- * Run one assistant turn in response to a user message.
- *
- * Yields every BusEvent the SSE stream needs to show: node.created for
- * the user and assistant nodes, active_leaf.changed, status.update,
- * content.delta, tool call events, and finally node.finalized +
- * active_leaf.changed. DB writes happen inline so the final node is
- * already persisted when node.finalized arrives.
- *
- * PHASE-2: approval gating for side-effect tools lives in the for-loop
- * body marked below.
- * PHASE-5b: a <think>-tag parser would slot into the content-chunk
- * handler to fork text into content.delta vs reasoning.delta.
+ * Run one full assistant turn triggered by a user message. Inserts the
+ * user node + placeholder assistant node, then runs the agent loop to
+ * completion, yielding every BusEvent the SSE stream needs.
  */
 export async function* runAgent(input: {
   conversationId: string;
@@ -109,16 +90,9 @@ export async function* runAgent(input: {
     return;
   }
 
-  const agent = await getAgentRaw(conv.agentId);
-  const model = agent?.model ?? config.defaultModel;
-  const systemPrompt = (agent?.systemPrompt && agent.systemPrompt.trim())
-    ? agent.systemPrompt
-    : DEFAULT_SYSTEM_PROMPT;
-
-  // -- 1. user node ----------------------------------------------------------
   const parentChain = parent ? await walkChain(conversationId, parent) : [];
   const branch = parentChain[parentChain.length - 1]?.branch ?? 'main';
-  const userId = newNodeId('n');
+  const userId = newNodeId();
   const userNode: MessageNode = await insertNode({
     id: userId,
     conversation_id: conversationId,
@@ -141,12 +115,47 @@ export async function* runAgent(input: {
     active_leaf_id: userId,
   };
 
-  // -- 2. placeholder assistant node ----------------------------------------
-  const asstId = newNodeId('n');
+  yield* runAssistantTurn({
+    conversationId,
+    parentUserNodeId: userId,
+    branch,
+  });
+}
+
+/**
+ * Generate just the assistant reply for an existing user node. Used by
+ * regenerate (§3.4) and edit-with-ripple (§3.2): both cases already have
+ * the user turn in place and need a fresh asst reply under it.
+ */
+export async function* runAssistantTurn(input: {
+  conversationId: string;
+  parentUserNodeId: string;
+  branch: string;
+}): AsyncGenerator<BusEvent, void, unknown> {
+  const { conversationId, parentUserNodeId, branch } = input;
+
+  const conv = await getConversationRaw(conversationId);
+  if (!conv) {
+    yield {
+      kind: 'error',
+      ...envelope(conversationId),
+      message: `conversation ${conversationId} not found`,
+      recoverable: false,
+    };
+    return;
+  }
+
+  const agent = await getAgentRaw(conv.agentId);
+  const model = agent?.model ?? config.defaultModel;
+  const systemPrompt = (agent?.systemPrompt && agent.systemPrompt.trim())
+    ? agent.systemPrompt
+    : DEFAULT_SYSTEM_PROMPT;
+
+  const asstId = newNodeId();
   const asstNode = await insertNode({
     id: asstId,
     conversation_id: conversationId,
-    parent_id: userId,
+    parent_id: parentUserNodeId,
     role: 'asst',
     branch,
     streaming: true,
@@ -163,8 +172,7 @@ export async function* runAgent(input: {
     elapsed_ms: 0,
   };
 
-  // -- 3. build Ollama history from the active chain ------------------------
-  const chain = await walkChain(conversationId, userId);
+  const chain = await walkChain(conversationId, parentUserNodeId);
   const history: OllamaMessage[] = [{ role: 'system', content: systemPrompt }];
   for (const m of chain) {
     history.push({
@@ -176,7 +184,7 @@ export async function* runAgent(input: {
   let accumulated = '';
   const finalToolCalls: ToolCallData[] = [];
 
-  // -- 4. agentic loop: stream → maybe tool calls → repeat ------------------
+  // -- agentic loop --
   for (let round = 0; round < config.maxToolRounds; round++) {
     let roundContent = '';
     const roundToolCalls: OllamaToolCall[] = [];
@@ -223,11 +231,8 @@ export async function* runAgent(input: {
 
       await updateNode(asstId, { content: accumulated });
 
-      if (roundToolCalls.length === 0) {
-        break; // no tools requested — normal finish
-      }
+      if (roundToolCalls.length === 0) break;
 
-      // Push the model's turn so the next round has it in context.
       history.push({
         role: 'assistant',
         content: roundContent,
@@ -238,11 +243,7 @@ export async function* runAgent(input: {
         const toolName = tc.function.name;
         const args = tc.function.arguments;
 
-        const proposedCall: ToolCallData = {
-          name: toolName,
-          args,
-          status: 'pending',
-        };
+        const proposedCall: ToolCallData = { name: toolName, args, status: 'pending' };
         yield {
           kind: 'toolcall.proposed',
           ...envelope(conversationId),
@@ -250,9 +251,6 @@ export async function* runAgent(input: {
           tool_call: proposedCall,
         };
 
-        // Approval gate: skip the round-trip if any layer auto-approves.
-        // Otherwise pause the generator until POST /approvals/:id/decide
-        // calls resolveApproval().
         const autoApproved = await isAutoApproved(conv.agentId, toolName);
         let denied = false;
         if (!autoApproved) {
@@ -267,8 +265,6 @@ export async function* runAgent(input: {
             body: approvalPayload.body,
             preview: approvalPayload.preview,
           });
-          // Attach to the node so the tree view can render the approval
-          // card on refresh, not just in-stream.
           await updateNode(asstId, { status: 'approval' });
 
           yield {
@@ -300,10 +296,7 @@ export async function* runAgent(input: {
           if (decision === 'always') {
             await insertGrant(conv.agentId, toolName);
           }
-
-          if (decision === 'deny') {
-            denied = true;
-          }
+          if (decision === 'deny') denied = true;
         }
 
         if (denied) {
@@ -389,7 +382,6 @@ export async function* runAgent(input: {
     }
   }
 
-  // -- 5. finalize -----------------------------------------------------------
   const finalized = await updateNode(asstId, { streaming: false, status: null });
   await updateConversationPointers(conversationId, {
     active_leaf_id: asstId,
