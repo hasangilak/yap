@@ -7,6 +7,7 @@ import type { RunAgentInput } from '@ag-ui/core';
 import { config } from './config.js';
 import { runAgent as runAgUiAgent } from './ollama-agent.js';
 import { apiV1 } from './api/index.js';
+import { bearerAuth } from './api/middleware/auth.js';
 
 const app = new Hono();
 const encoder = new EventEncoder();
@@ -35,6 +36,7 @@ app.post('/', async (c) => {
   });
 });
 
+app.use('/api/v1/*', bearerAuth);
 app.route('/api/v1', apiV1);
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {
