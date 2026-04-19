@@ -205,6 +205,24 @@ model Clarify {
   @@map("clarifications")
 }
 
+/// Phase 8: idempotency record for mutating POST/PATCH/DELETE. Clients
+/// pass an Idempotency-Key header; the first response is cached for
+/// 24h so retries replay the same status + body instead of causing a
+/// second side-effect.
+model IdempotencyRecord {
+  key         String
+  method      String
+  path        String
+  status      Int
+  contentType String   @default("application/json") @map("content_type")
+  body        String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@id([key, method, path])
+  @@index([createdAt])
+  @@map("idempotency_records")
+}
+
 /// Phase 2: persistent "allow always" grants keyed by (user, agent, tool).
 /// userId is hardcoded 'local' until the multi-user phase lands.
 model ApprovalGrant {

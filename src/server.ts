@@ -8,6 +8,7 @@ import { config } from './config.js';
 import { runAgent as runAgUiAgent } from './ollama-agent.js';
 import { apiV1 } from './api/index.js';
 import { bearerAuth } from './api/middleware/auth.js';
+import { idempotency } from './api/middleware/idempotency.js';
 
 const app = new Hono();
 const encoder = new EventEncoder();
@@ -37,6 +38,7 @@ app.post('/', async (c) => {
 });
 
 app.use('/api/v1/*', bearerAuth);
+app.use('/api/v1/*', idempotency);
 app.route('/api/v1', apiV1);
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {
