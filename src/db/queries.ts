@@ -6,8 +6,10 @@ import type {
   BusEvent,
   ClarifyData,
   Conversation,
+  Decision,
   MessageNode,
   MessageTree,
+  PermissionDefault,
   Role,
   StatusState,
   ToolCallData,
@@ -400,6 +402,116 @@ export async function insertEvent(ev: BusEvent): Promise<void> {
       at: new Date(ev.at),
     },
   });
+}
+
+// -- approvals (Phase 2) -------------------------------------------------------
+
+export interface InsertApprovalInput {
+  id: string;
+  conversation_id: string;
+  node_id: string;
+  tool: string;
+  title: string;
+  body: string;
+  preview?: string;
+}
+
+export async function insertApproval(a: InsertApprovalInput): Promise<void> {
+  await getPrisma().approval.create({
+    data: {
+      id: a.id,
+      conversationId: a.conversation_id,
+      nodeId: a.node_id,
+      tool: a.tool,
+      title: a.title,
+      body: a.body,
+      preview: a.preview ?? null,
+    },
+  });
+}
+
+export interface ApprovalRow {
+  id: string;
+  conversationId: string;
+  nodeId: string;
+  tool: string;
+  title: string;
+  body: string;
+  preview: string | null;
+  decision: string | null;
+  decidedAt: Date | null;
+  rememberKey: string | null;
+  createdAt: Date;
+}
+
+export async function getApproval(id: string): Promise<ApprovalRow | null> {
+  return getPrisma().approval.findUnique({ where: { id } });
+}
+
+export async function recordApprovalDecision(
+  id: string,
+  decision: Decision,
+  rememberKey: string | null,
+): Promise<ApprovalRow | null> {
+  return getPrisma().approval.update({
+    where: { id },
+    data: {
+      decision,
+      decidedAt: new Date(),
+      rememberKey,
+    },
+  });
+}
+
+// -- approval grants (Phase 2) -------------------------------------------------
+
+const LOCAL_USER = 'local';
+
+export async function hasGrant(agentId: string, toolId: string): Promise<boolean> {
+  const row = await getPrisma().approvalGrant.findUnique({
+    where: { userId_agentId_toolId: { userId: LOCAL_USER, agentId, toolId } },
+  });
+  return row !== null;
+}
+
+export async function insertGrant(agentId: string, toolId: string): Promise<void> {
+  await getPrisma().approvalGrant.upsert({
+    where: { userId_agentId_toolId: { userId: LOCAL_USER, agentId, toolId } },
+    update: {},
+    create: { userId: LOCAL_USER, agentId, toolId },
+  });
+}
+
+export interface GrantRow {
+  userId: string;
+  agentId: string;
+  toolId: string;
+  createdAt: Date;
+}
+
+export async function listGrants(): Promise<GrantRow[]> {
+  return getPrisma().approvalGrant.findMany({ orderBy: [{ agentId: 'asc' }, { toolId: 'asc' }] });
+}
+
+export async function deleteGrant(agentId: string, toolId: string): Promise<boolean> {
+  try {
+    await getPrisma().approvalGrant.delete({
+      where: { userId_agentId_toolId: { userId: LOCAL_USER, agentId, toolId } },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Agent's permission default, falling back to 'ask_every_time' when missing. */
+export async function getAgentPermission(agentId: string): Promise<PermissionDefault> {
+  const row = await getPrisma().agent.findUnique({
+    where: { id: agentId },
+    select: { permissionDefault: true },
+  });
+  const v = row?.permissionDefault ?? 'ask_every_time';
+  return (v === 'auto_allow_read' || v === 'auto_allow_all' ? v : 'ask_every_time') as PermissionDefault;
 }
 
 export async function listEventsSince(

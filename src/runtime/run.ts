@@ -2,17 +2,66 @@ import { randomUUID } from 'node:crypto';
 import { Ollama, type Message as OllamaMessage } from 'ollama';
 import { config } from '../config.js';
 import { newEventId } from '../events/types.js';
-import { executeTool, OLLAMA_TOOLS } from '../registry/tools.js';
+import { executeTool, isSideEffectful, OLLAMA_TOOLS, TOOL_DEFS } from '../registry/tools.js';
 import {
+  getAgentPermission,
   getAgentRaw,
   getConversationRaw,
+  hasGrant,
+  insertApproval,
+  insertGrant,
   insertNode,
   updateConversationPointers,
   updateNode,
   walkChain,
 } from '../db/queries.js';
+import { awaitDecision } from './approvals.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../system-prompt.js';
-import type { BusEvent, MessageNode, ToolCallData } from '../schemas/index.js';
+import type {
+  ApprovalData,
+  BusEvent,
+  MessageNode,
+  ToolCallData,
+} from '../schemas/index.js';
+
+/**
+ * Approval decision under the three-layer model in docs/server-spec.md §6:
+ * session grant → agent permission_default → agent-level tool auto flag.
+ * Phase 2 pools agent-level auto into the global TOOL_DEFS.auto flag
+ * because chat-box's Agent type has no per-tool overrides yet; Phase 4's
+ * agent builder will split them.
+ */
+async function isAutoApproved(agentId: string, toolName: string): Promise<boolean> {
+  if (await hasGrant(agentId, toolName)) return true;
+
+  const perm = await getAgentPermission(agentId);
+  if (perm === 'auto_allow_all') return true;
+
+  // Side-effect tools always need approval unless the agent is set to
+  // auto_allow_all (handled above) or a grant exists.
+  if (isSideEffectful(toolName)) return false;
+
+  // Non-side-effect tools: auto_allow_read blanket-approves them, and
+  // the tool's own auto flag covers the default case (e.g. web_search).
+  if (perm === 'auto_allow_read') return true;
+  const toolDef = TOOL_DEFS.find((t) => t.id === toolName);
+  return toolDef?.auto === true;
+}
+
+function approvalPayloadFor(toolName: string, args: Record<string, unknown>): ApprovalData {
+  const toolDef = TOOL_DEFS.find((t) => t.id === toolName);
+  const desc = toolDef?.desc ?? toolName;
+  const preview = (() => {
+    const compact = JSON.stringify(args);
+    return compact.length > 200 ? compact.slice(0, 197) + '...' : compact;
+  })();
+  return {
+    tool: toolName,
+    title: `Run ${toolName}`,
+    body: desc,
+    preview,
+  };
+}
 
 const ollama = new Ollama({ host: config.ollamaHost });
 
@@ -189,9 +238,6 @@ export async function* runAgent(input: {
         const toolName = tc.function.name;
         const args = tc.function.arguments;
 
-        // PHASE-2: if isSideEffectful(toolName), emit approval.requested
-        // here, await the decision event, and only proceed on 'allow' /
-        // 'always'. For Phase 1 we auto-approve everything we advertise.
         const proposedCall: ToolCallData = {
           name: toolName,
           args,
@@ -203,6 +249,89 @@ export async function* runAgent(input: {
           node_id: asstId,
           tool_call: proposedCall,
         };
+
+        // Approval gate: skip the round-trip if any layer auto-approves.
+        // Otherwise pause the generator until POST /approvals/:id/decide
+        // calls resolveApproval().
+        const autoApproved = await isAutoApproved(conv.agentId, toolName);
+        let denied = false;
+        if (!autoApproved) {
+          const approvalId = `ap-${randomUUID().slice(0, 8)}`;
+          const approvalPayload = approvalPayloadFor(toolName, args);
+          await insertApproval({
+            id: approvalId,
+            conversation_id: conversationId,
+            node_id: asstId,
+            tool: approvalPayload.tool,
+            title: approvalPayload.title,
+            body: approvalPayload.body,
+            preview: approvalPayload.preview,
+          });
+          // Attach to the node so the tree view can render the approval
+          // card on refresh, not just in-stream.
+          await updateNode(asstId, { status: 'approval' });
+
+          yield {
+            kind: 'approval.requested',
+            ...envelope(conversationId),
+            node_id: asstId,
+            approval_id: approvalId,
+            approval: approvalPayload,
+          };
+          yield {
+            kind: 'status.update',
+            ...envelope(conversationId),
+            node_id: asstId,
+            state: 'approval',
+            elapsed_ms: Date.now() - runStart,
+            tool: toolName,
+          };
+
+          const decision = await awaitDecision(approvalId);
+
+          yield {
+            kind: 'approval.decided',
+            ...envelope(conversationId),
+            node_id: asstId,
+            approval_id: approvalId,
+            decision,
+          };
+
+          if (decision === 'always') {
+            await insertGrant(conv.agentId, toolName);
+          }
+
+          if (decision === 'deny') {
+            denied = true;
+          }
+        }
+
+        if (denied) {
+          const deniedCall: ToolCallData = {
+            name: toolName,
+            args,
+            status: 'err',
+            elapsed: '0.0s',
+          };
+          finalToolCalls.push(deniedCall);
+          await updateNode(asstId, { tool_call: deniedCall, status: null });
+          yield {
+            kind: 'toolcall.ended',
+            ...envelope(conversationId),
+            node_id: asstId,
+            status: 'err',
+            elapsed_ms: 0,
+            error: 'Denied by user',
+          };
+          history.push({
+            role: 'tool',
+            content: `The user denied the ${toolName} call. Continue without it.`,
+          });
+          continue;
+        }
+
+        await updateNode(asstId, { status: null });
+
         yield {
           kind: 'toolcall.started',
           ...envelope(conversationId),
