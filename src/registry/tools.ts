@@ -1,3 +1,7 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import type { Tool } from 'ollama';
+import { config } from '../config.js';
 import { webSearch } from '../tools/browser.js';
 import type { ToolDef } from '../schemas/index.js';
 
@@ -64,7 +68,7 @@ export const TOOL_DEFS: ToolDef[] = [
  * request a tool. Only read-only tools with a real Phase 1 implementation
  * are advertised — side-effect tools live in Phase 2.
  */
-export const OLLAMA_TOOLS = [
+export const OLLAMA_TOOLS: Tool[] = [
   {
     type: 'function' as const,
     function: {
@@ -77,6 +81,29 @@ export const OLLAMA_TOOLS = [
           query: { type: 'string', description: 'The search query.' },
         },
         required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'write_file',
+      description:
+        'Write a text file to the sandboxed artifacts directory. Use for code, drafts, notes, and anything the user should be able to keep after the turn. Requires user approval unless the agent has auto_allow_all set.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description:
+              'Relative path under the artifacts dir. Must not contain ".." segments or start with /. Directories are created automatically.',
+          },
+          content: {
+            type: 'string',
+            description: 'The file contents to write.',
+          },
+        },
+        required: ['path', 'content'],
       },
     },
   },
@@ -109,10 +136,33 @@ export async function executeTool(
       const result = await webSearch(query);
       return { status: 'ok', elapsed_ms: Date.now() - start, result };
     }
+    if (name === 'write_file') {
+      const rawPath = String(args.path ?? '').trim();
+      const content = String(args.content ?? '');
+      if (!rawPath) {
+        return { status: 'err', elapsed_ms: 0, error: 'write_file requires a non-empty "path" argument' };
+      }
+      if (isAbsolute(rawPath) || rawPath.startsWith('~') || rawPath.split(/[\\/]/).some((s) => s === '..')) {
+        return { status: 'err', elapsed_ms: 0, error: `path '${rawPath}' escapes the artifacts sandbox` };
+      }
+      const full = resolve(config.artifactsDir, rawPath);
+      // Defensive: after resolution, full must still be under artifactsDir.
+      if (relative(config.artifactsDir, full).startsWith('..')) {
+        return { status: 'err', elapsed_ms: 0, error: `path '${rawPath}' escapes the artifacts sandbox` };
+      }
+      await mkdir(dirname(full), { recursive: true });
+      await writeFile(full, content, 'utf8');
+      const bytes = Buffer.byteLength(content, 'utf8');
+      return {
+        status: 'ok',
+        elapsed_ms: Date.now() - start,
+        result: `✓ wrote ${rawPath} (${bytes} bytes)`,
+      };
+    }
     return {
       status: 'err',
       elapsed_ms: Date.now() - start,
-      error: `tool '${name}' is not implemented in Phase 1`,
+      error: `tool '${name}' is not implemented yet`,
     };
   } catch (err) {
     return {
