@@ -20,6 +20,7 @@ import {
 } from '../db/queries.js';
 import { awaitDecision } from './approvals.js';
 import { awaitAnswer } from './clarifications.js';
+import { ThinkSplitter } from './think-splitter.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../system-prompt.js';
 import type {
   ApprovalData,
@@ -201,12 +202,61 @@ export async function* runAssistantTurn(input: {
   }
 
   let accumulated = '';
+  const reasoningSteps: string[] = [];
+  const reasoningBuffer: string[] = [];
   const finalToolCalls: ToolCallData[] = [];
 
   // -- agentic loop --
   for (let round = 0; round < config.maxToolRounds; round++) {
     let roundContent = '';
     const roundToolCalls: OllamaToolCall[] = [];
+    const splitter = new ThinkSplitter();
+
+    // Helper: dispatch splitter segments to events + accumulators.
+    const dispatch = (segments: ReturnType<ThinkSplitter['feed']>): BusEvent[] => {
+      const events: BusEvent[] = [];
+      for (const seg of segments) {
+        if (seg.type === 'content') {
+          accumulated += seg.text;
+          roundContent += seg.text;
+          events.push({
+            kind: 'content.delta',
+            ...envelope(conversationId),
+            node_id: asstId,
+            delta: seg.text,
+          });
+          events.push({
+            kind: 'status.update',
+            ...envelope(conversationId),
+            node_id: asstId,
+            state: 'streaming',
+            elapsed_ms: Date.now() - runStart,
+          });
+        } else if (seg.type === 'reasoning') {
+          reasoningBuffer[seg.step_index] =
+            (reasoningBuffer[seg.step_index] ?? '') + seg.text;
+          events.push({
+            kind: 'reasoning.delta',
+            ...envelope(conversationId),
+            node_id: asstId,
+            step_index: seg.step_index,
+            delta: seg.text,
+          });
+        } else {
+          // reasoning_end
+          const finalText = reasoningBuffer[seg.step_index] ?? '';
+          reasoningSteps.push(finalText);
+          events.push({
+            kind: 'reasoning.step.end',
+            ...envelope(conversationId),
+            node_id: asstId,
+            step_index: seg.step_index,
+            final_text: finalText,
+          });
+        }
+      }
+      return events;
+    };
 
     try {
       const stream = await ollama.chat({
@@ -219,21 +269,7 @@ export async function* runAssistantTurn(input: {
       for await (const part of stream) {
         const delta = part.message?.content;
         if (delta) {
-          roundContent += delta;
-          accumulated += delta;
-          yield {
-            kind: 'content.delta',
-            ...envelope(conversationId),
-            node_id: asstId,
-            delta,
-          };
-          yield {
-            kind: 'status.update',
-            ...envelope(conversationId),
-            node_id: asstId,
-            state: 'streaming',
-            elapsed_ms: Date.now() - runStart,
-          };
+          for (const ev of dispatch(splitter.feed(delta))) yield ev;
         }
         const tcs = part.message?.tool_calls;
         if (tcs) {
@@ -248,7 +284,13 @@ export async function* runAssistantTurn(input: {
         }
       }
 
-      await updateNode(asstId, { content: accumulated });
+      // Drain any chars the splitter was holding back.
+      for (const ev of dispatch(splitter.flush())) yield ev;
+
+      await updateNode(asstId, {
+        content: accumulated,
+        ...(reasoningSteps.length > 0 ? { reasoning: reasoningSteps } : {}),
+      });
 
       if (roundToolCalls.length === 0) break;
 
