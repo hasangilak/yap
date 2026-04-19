@@ -11,6 +11,10 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
     "db:generate": "prisma generate",
     "db:push": "prisma db push --accept-data-loss",
     "postinstall": "prisma generate"
@@ -31,6 +35,7 @@
     "@types/node": "^22.10.0",
     "prisma": "6",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.4"
   }
 }
