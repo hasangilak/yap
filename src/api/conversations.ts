@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
+import { getPrisma } from '../db/index.js';
 import {
   firstAgentId,
   getConversation,
@@ -11,6 +12,16 @@ import { CreateConversationRequestSchema } from '../schemas/index.js';
 
 export const conversationsRouter = new Hono();
 
+async function resolveAgentId(input: string | undefined): Promise<string | null> {
+  if (!input) return firstAgentId();
+  // chat-box's Conversation.agent is a display name. Accept either a
+  // real id (a-xx) or a display name — look by id first, then by name.
+  const byId = await getPrisma().agent.findUnique({ where: { id: input }, select: { id: true } });
+  if (byId) return byId.id;
+  const byName = await getPrisma().agent.findFirst({ where: { name: input }, select: { id: true } });
+  return byName?.id ?? null;
+}
+
 conversationsRouter.get('/', async (c) => {
   const rows = await listConversations();
   return c.json(rows);
@@ -18,9 +29,9 @@ conversationsRouter.get('/', async (c) => {
 
 conversationsRouter.post('/', async (c) => {
   const body = CreateConversationRequestSchema.parse(await c.req.json());
-  const agentId = body.agent ?? (await firstAgentId());
+  const agentId = await resolveAgentId(body.agent);
   if (!agentId) {
-    return c.json({ error: 'no agents exist; seed the DB first' }, 400);
+    return c.json({ error: 'no matching agent; seed the DB first' }, 400);
   }
   const id = `c-${randomUUID().slice(0, 8)}`;
   await insertConversation({
