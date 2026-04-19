@@ -1,5 +1,9 @@
 import { spawn } from 'node:child_process';
-import { config } from '../config.js';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const CHROME_LESS_CLI =
+  process.env.CHROME_LESS_BIN ?? require.resolve('chrome-less/dist/cli.js');
 
 interface RunResult {
   stdout: string;
@@ -9,7 +13,7 @@ interface RunResult {
 
 function run(args: string[]): Promise<RunResult> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const proc = spawn('node', [config.chromeLessBin, ...args], {
+    const proc = spawn('node', [CHROME_LESS_CLI, ...args], {
       env: { ...process.env },
     });
     let stdout = '';

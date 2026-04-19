@@ -17,6 +17,9 @@ importers:
       '@hono/node-server':
         specifier: ^1.19.14
         version: 1.19.14(hono@4.12.14)
+      chrome-less:
+        specifier: github:hasangilak/chrome-cli
+        version: https://codeload.github.com/hasangilak/chrome-cli/tar.gz/49e721aec4d687db24add69320780c36a7f8a644
       hono:
         specifier: ^4.12.14
         version: 4.12.14
@@ -217,6 +220,12 @@ packages:
   '@types/node@22.19.17':
     resolution: {integrity: sha512-wGdMcf+vPYM6jikpS/qhg6WiqSV/OhG+jeeHT/KlVqxYfD40iYJf9/AE1uQxVWFvU7MipKRkRv8NSHiCGgPr8Q==}
 
+  chrome-less@https://codeload.github.com/hasangilak/chrome-cli/tar.gz/49e721aec4d687db24add69320780c36a7f8a644:
+    resolution: {tarball: https://codeload.github.com/hasangilak/chrome-cli/tar.gz/49e721aec4d687db24add69320780c36a7f8a644}
+    version: 0.1.0
+    engines: {node: '>=20'}
+    hasBin: true
+
   esbuild@0.27.7:
     resolution: {integrity: sha512-IxpibTjyVnmrIQo5aqNpCgoACA/dTKLTlhMHihVHhdkxKyPO1uBBthumT0rdHmcsk9uMonIWS0m4FljWzILh3w==}
     engines: {node: '>=18'}
@@ -255,6 +264,18 @@ packages:
 
   whatwg-fetch@3.6.20:
     resolution: {integrity: sha512-EqhiFU6daOA8kpjOWTL0olhVOF3i7OrFzSYiGsEMB8GcXS+RrzauAERX65xMeNWVqxA6HXH2m69Z9LaKKdisfg==}
+
+  ws@8.20.0:
+    resolution: {integrity: sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
 
   zod@3.25.76:
     resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
@@ -366,6 +387,13 @@ snapshots:
     dependencies:
       undici-types: 6.21.0
 
+  chrome-less@https://codeload.github.com/hasangilak/chrome-cli/tar.gz/49e721aec4d687db24add69320780c36a7f8a644:
+    dependencies:
+      ws: 8.20.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
   esbuild@0.27.7:
     optionalDependencies:
       '@esbuild/aix-ppc64': 0.27.7
@@ -422,5 +450,7 @@ snapshots:
   undici-types@6.21.0: {}
 
   whatwg-fetch@3.6.20: {}
+
+  ws@8.20.0: {}
 
   zod@3.25.76: {}

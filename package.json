@@ -5,17 +5,18 @@
   "description": "AG-UI compatible server that bridges Ollama to the Agent-User Interaction Protocol.",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
+    "dev": "NODE_OPTIONS=--experimental-sqlite tsx watch src/server.ts",
+    "start": "NODE_OPTIONS=--experimental-sqlite tsx src/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@ag-ui/core": "^0.0.52",
     "@ag-ui/encoder": "^0.0.52",
     "@hono/node-server": "^1.19.14",
+    "chrome-less": "github:hasangilak/chrome-cli",
     "hono": "^4.12.14",
     "ollama": "^0.6.3"
   },

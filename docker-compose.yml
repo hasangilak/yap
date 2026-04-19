@@ -1,0 +1,52 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: yap-ollama
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: pulls the default model into the ollama volume on first
+  # `compose up`, then exits. Re-runs on every `up` but is a no-op once
+  # the weights are cached in the volume.
+  model-init:
+    image: ollama/ollama:latest
+    container_name: yap-model-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["sh", "-c"]
+    command: ['ollama pull "${MODEL:-qwen2.5:14b}"']
+    restart: "no"
+
+  yap:
+    build: .
+    container_name: yap
+    depends_on:
+      ollama:
+        condition: service_healthy
+      model-init:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL: ${MODEL:-qwen2.5:14b}
+      PORT: "3001"
+      MAX_TOOL_ROUNDS: "8"
+      DB_PATH: /home/yap/app/data/yap.db
+    ports:
+      - "3001:3001"
+    volumes:
+      - yap-data:/home/yap/app/data
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
+  yap-data:
