@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Prisma } from '@prisma/client';
 import { Ollama, type Message as OllamaMessage } from 'ollama';
 import { config } from '../config.js';
 import { newEventId } from '../events/types.js';
@@ -9,22 +10,40 @@ import {
   getConversationRaw,
   hasGrant,
   insertApproval,
+  insertClarify,
   insertGrant,
   insertNode,
+  recordClarifyResponse,
   updateConversationPointers,
   updateNode,
   walkChain,
 } from '../db/queries.js';
 import { awaitDecision } from './approvals.js';
+import { awaitAnswer } from './clarifications.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../system-prompt.js';
 import type {
   ApprovalData,
   BusEvent,
+  ClarifyData,
   MessageNode,
   ToolCallData,
 } from '../schemas/index.js';
 
 const ollama = new Ollama({ host: config.ollamaHost });
+
+// Tiny façade so the clarify branch can write the node's embedded
+// clarify JSON without widening updateNode's signature for a Phase 5a
+// concern. This goes away once Phase 5a+ consolidates clarify storage.
+async function getPrismaFacadeUpdateClarify(
+  nodeId: string,
+  clarify: ClarifyData,
+): Promise<void> {
+  const { getPrisma } = await import('../db/index.js');
+  await getPrisma().node.update({
+    where: { id: nodeId },
+    data: { clarify: clarify as unknown as Prisma.InputJsonValue },
+  });
+}
 
 function newNodeId(): string {
   return `n-${randomUUID().slice(0, 8)}`;
@@ -242,6 +261,83 @@ export async function* runAssistantTurn(input: {
       for (const tc of roundToolCalls) {
         const toolName = tc.function.name;
         const args = tc.function.arguments;
+
+        // ask_clarification is modeled as a tool call the model issues,
+        // but it's really a pause-for-user mechanic — not an executable
+        // tool. Short-circuit into the clarify flow: persist a Clarify
+        // row, emit clarify.requested, block on the user's answer,
+        // push that back as the "tool result" the model sees, continue.
+        if (toolName === 'ask_clarification') {
+          const clarifyId = `cl-${randomUUID().slice(0, 8)}`;
+          const chipsRaw = Array.isArray(args.chips) ? (args.chips as unknown[]) : [];
+          const clarifyData: ClarifyData = {
+            question: String(args.question ?? 'Could you clarify?'),
+            chips: chipsRaw.map((label, i) => ({
+              id: `c-${i}`,
+              label: String(label),
+            })),
+            input: String(args.input_hint ?? ''),
+          };
+          await insertClarify({
+            id: clarifyId,
+            conversation_id: conversationId,
+            node_id: asstId,
+            question: clarifyData.question,
+            chips: clarifyData.chips,
+            input_hint: clarifyData.input,
+          });
+          await updateNode(asstId, { status: 'approval' });
+
+          yield {
+            kind: 'clarify.requested',
+            ...envelope(conversationId),
+            node_id: asstId,
+            clarify_id: clarifyId,
+            clarify: clarifyData,
+          };
+          yield {
+            kind: 'status.update',
+            ...envelope(conversationId),
+            node_id: asstId,
+            state: 'approval',
+            elapsed_ms: Date.now() - runStart,
+          };
+
+          const response = await awaitAnswer(clarifyId);
+          await recordClarifyResponse(clarifyId, response);
+
+          yield {
+            kind: 'clarify.answered',
+            ...envelope(conversationId),
+            node_id: asstId,
+            clarify_id: clarifyId,
+            response,
+          };
+
+          const pickedLabels = clarifyData.chips
+            .filter((c) => response.selected_chip_ids.includes(c.id))
+            .map((c) => c.label);
+          const summary = [
+            pickedLabels.length
+              ? `Selected: ${pickedLabels.join(', ')}.`
+              : 'No chips selected.',
+            response.text ? `Free-form: ${response.text}` : 'No free-form text.',
+          ].join(' ');
+
+          // Persist on the node so tree-view shows the answered state.
+          const answeredClarify: ClarifyData = {
+            ...clarifyData,
+            chips: clarifyData.chips.map((c) => ({
+              ...c,
+              selected: response.selected_chip_ids.includes(c.id),
+            })),
+          };
+          await updateNode(asstId, { status: null });
+          await getPrismaFacadeUpdateClarify(asstId, answeredClarify);
+
+          history.push({ role: 'tool', content: summary });
+          continue;
+        }
 
         const proposedCall: ToolCallData = { name: toolName, args, status: 'pending' };
         yield {

@@ -107,6 +107,33 @@ export const OLLAMA_TOOLS: Tool[] = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'ask_clarification',
+      description:
+        'Ask the user a clarifying question with optional multi-select chips. Use this when you need structured input before proceeding — especially useful when the user\'s request is ambiguous or when constraints (idempotency, jitter, retry budget, etc.) would change the shape of the answer. The user will pick chips and/or type free-form text; your next turn will have their choice as a tool result.',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: {
+            type: 'string',
+            description: 'The clarifying question shown above the chips.',
+          },
+          chips: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Short answer options the user can tick. Keep to 2–6 labels.',
+          },
+          input_hint: {
+            type: 'string',
+            description: 'Placeholder text for the free-form input below the chips.',
+          },
+        },
+        required: ['question'],
+      },
+    },
+  },
 ];
 
 export interface ToolExecResult {
