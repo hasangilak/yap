@@ -14,8 +14,14 @@ import {
   CreateAgentRequestSchema,
   PatchAgentRequestSchema,
 } from '../schemas/index.js';
+import { agentStubsRouter, fromTemplateRouter } from './agent-templates.js';
 
 export const agentsRouter = new Hono();
+
+// Mounted on the agents router so /api/v1/agents/from-template/:tpl is
+// reachable without introducing a top-level route.
+agentsRouter.route('/from-template', fromTemplateRouter);
+agentsRouter.route('/', agentStubsRouter);
 
 agentsRouter.get('/', async (c) => {
   return c.json(await listAgents());
