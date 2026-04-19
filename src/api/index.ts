@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { agentsRouter } from './agents.js';
+import { approvalsRouter } from './approvals.js';
 import { conversationsRouter } from './conversations.js';
 import { devRouter } from './dev.js';
 import { messagesRouter } from './messages.js';
@@ -16,4 +17,5 @@ apiV1.route('/', streamRouter);
 apiV1.route('/conversations', conversationsRouter);
 apiV1.route('/agents', agentsRouter);
 apiV1.route('/tools', toolsRouter);
+apiV1.route('/approvals', approvalsRouter);
 apiV1.route('/dev', devRouter);
