@@ -23,12 +23,66 @@ model Conversation {
   activeLeafId   String?  @map("active_leaf_id")
   tokenBudget    Int      @default(200000) @map("token_budget")
   tokensUsed     Int      @default(0)      @map("tokens_used")
+  /// Phase 7: non-null when the conversation is shared publicly via
+  /// GET /shared/:token. DELETE /share nulls it to revoke.
+  shareToken     String?  @unique @map("share_token")
 
   nodes  Node[]
   events Event[]
+  tags   ConversationTag[]
 
   @@index([pinned(sort: Desc), updatedAt(sort: Desc)])
   @@map("conversations")
+}
+
+/// Phase 7: workspace-level tag catalog. Conversations attach via
+/// the ConversationTag join so one conversation can carry many tags.
+/// The legacy single-tag `Conversation.tag` column stays for now as
+/// the primary display tag; m2m attachment augments it.
+model Tag {
+  id        String   @id
+  name      String   @unique
+  color     String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  conversations ConversationTag[]
+
+  @@map("tags")
+}
+
+model ConversationTag {
+  conversationId String @map("conversation_id")
+  tagId          String @map("tag_id")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  tag          Tag          @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, tagId])
+  @@index([tagId])
+  @@map("conversation_tags")
+}
+
+/// Phase 7: one free-form note per conversation (upserted on PUT).
+model ThreadNote {
+  conversationId String   @id @map("conversation_id")
+  body           String   @default("")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("thread_notes")
+}
+
+/// Phase 7: a user-pinned excerpt pulled from a specific node,
+/// surfaced in the Inspector Notes tab.
+model PinnedSnippet {
+  id             String   @id
+  conversationId String   @map("conversation_id")
+  sourceNodeId   String   @map("source_node_id")
+  label          String
+  excerpt        String
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([conversationId])
+  @@map("pinned_snippets")
 }
 
 /// One message in the conversation tree. The wire shape omits several
