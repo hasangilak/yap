@@ -8,6 +8,7 @@ import { conversationsRouter } from './conversations.js';
 import { devRouter } from './dev.js';
 import { messagesRouter } from './messages.js';
 import { nodesRouter } from './nodes.js';
+import { notesRouter } from './notes.js';
 import { streamRouter } from './stream.js';
 import { tagsRouter } from './tags.js';
 import { toolsRouter } from './tools.js';
@@ -18,6 +19,7 @@ export const apiV1 = new Hono();
 // the v1 root; Hono's route matcher handles the overlap.
 apiV1.route('/', messagesRouter);
 apiV1.route('/', streamRouter);
+apiV1.route('/', notesRouter);
 
 apiV1.route('/conversations', conversationsRouter);
 apiV1.route('/agents', agentsRouter);
