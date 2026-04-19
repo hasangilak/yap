@@ -13,6 +13,7 @@ import {
   insertClarify,
   insertGrant,
   insertNode,
+  recordArtifactWrite,
   recordClarifyResponse,
   updateConversationPointers,
   updateNode,
@@ -501,6 +502,39 @@ export async function* runAssistantTurn(input: {
           ...(exec.result !== undefined ? { result: exec.result } : {}),
           ...(exec.error !== undefined ? { error: exec.error } : {}),
         };
+
+        // Phase 6: write_file promotes to a versioned artifact. We
+        // recompute content from args so we don't rely on the tool
+        // result string carrying the bytes.
+        if (
+          toolName === 'write_file' &&
+          finalStatus === 'ok' &&
+          typeof args.path === 'string' &&
+          typeof args.content === 'string'
+        ) {
+          try {
+            const { artifact, version } = await recordArtifactWrite({
+              conversation_id: conversationId,
+              title: args.path,
+              content: args.content,
+              author: 'asst',
+              produced_by_node_id: asstId,
+              message: `Written by ${toolName}`,
+            });
+            yield {
+              kind: 'artifact.updated',
+              ...envelope(conversationId),
+              artifact_id: artifact.id,
+              version_id: version.id,
+              version: version.version,
+              title: artifact.title,
+            };
+          } catch (err) {
+            // Artifact bookkeeping failure shouldn't kill the turn;
+            // log and continue so the user still gets a reply.
+            console.error('[artifact]', err);
+          }
+        }
 
         history.push({
           role: 'tool',
