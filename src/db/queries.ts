@@ -1,7 +1,11 @@
 import { Prisma } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import { getPrisma } from './index.js';
 import type {
   Agent,
+  AgentFull,
+  AgentVariable,
+  AgentVersion,
   ApprovalData,
   BusEvent,
   ClarifyData,
@@ -320,6 +324,8 @@ export interface InsertAgentInput {
   max_tokens?: number;
   system_prompt?: string;
   tool_ids?: string[];
+  variables?: AgentVariable[];
+  permission_default?: PermissionDefault;
 }
 
 export async function insertAgent(a: InsertAgentInput): Promise<void> {
@@ -337,8 +343,286 @@ export async function insertAgent(a: InsertAgentInput): Promise<void> {
       maxTokens: a.max_tokens ?? 4096,
       systemPrompt: a.system_prompt ?? '',
       toolIds: a.tool_ids ?? [],
+      variables: a.variables ?? [],
+      permissionDefault: a.permission_default ?? 'ask_every_time',
     },
   });
+}
+
+// -- agent CRUD + versions (Phase 4) -------------------------------------
+
+function newAgentId(): string {
+  return `a-${randomUUID().slice(0, 8)}`;
+}
+
+function newVersionId(): string {
+  return `av-${randomUUID().slice(0, 8)}`;
+}
+
+function rowToAgentFull(row: {
+  id: string;
+  name: string;
+  initial: string;
+  description: string;
+  model: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  systemPrompt: string;
+  toolIds: unknown;
+  variables: unknown;
+  permissionDefault: string;
+  currentVersionId: string | null;
+}): AgentFull {
+  return {
+    id: row.id,
+    name: row.name,
+    initial: row.initial,
+    desc: row.description,
+    model: row.model,
+    temperature: row.temperature,
+    top_p: row.topP,
+    max_tokens: row.maxTokens,
+    system_prompt: row.systemPrompt,
+    variables: Array.isArray(row.variables) ? (row.variables as AgentVariable[]) : [],
+    tool_ids: Array.isArray(row.toolIds) ? (row.toolIds as string[]) : [],
+    permission_default: (row.permissionDefault as PermissionDefault) ?? 'ask_every_time',
+    current_version_id: row.currentVersionId,
+  };
+}
+
+function snapshotOf(full: AgentFull): Omit<AgentFull, 'id' | 'current_version_id'> {
+  const { id: _id, current_version_id: _cv, ...rest } = full;
+  return rest;
+}
+
+export interface CreateAgentInput {
+  name: string;
+  initial?: string;
+  desc?: string;
+  model?: string;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  system_prompt?: string;
+  variables?: AgentVariable[];
+  tool_ids?: string[];
+  permission_default?: PermissionDefault;
+  message?: string;
+}
+
+/**
+ * Create a new agent and its initial v1 AgentVersion in one transaction.
+ * Returns the full editable shape with `current_version_id` populated.
+ */
+export async function createAgent(input: CreateAgentInput): Promise<AgentFull> {
+  const prisma = getPrisma();
+  const id = newAgentId();
+  const versionId = newVersionId();
+  const initial = (input.initial ?? input.name[0] ?? '?').toUpperCase();
+
+  const fullAfter: AgentFull = {
+    id,
+    name: input.name,
+    initial,
+    desc: input.desc ?? '',
+    model: input.model ?? 'qwen2.5:14b',
+    temperature: input.temperature ?? 0.5,
+    top_p: input.top_p ?? 1.0,
+    max_tokens: input.max_tokens ?? 4096,
+    system_prompt: input.system_prompt ?? '',
+    variables: input.variables ?? [],
+    tool_ids: input.tool_ids ?? [],
+    permission_default: input.permission_default ?? 'ask_every_time',
+    current_version_id: versionId,
+  };
+
+  await prisma.$transaction([
+    prisma.agent.create({
+      data: {
+        id: fullAfter.id,
+        name: fullAfter.name,
+        initial: fullAfter.initial,
+        description: fullAfter.desc,
+        model: fullAfter.model,
+        temperature: fullAfter.temperature,
+        topP: fullAfter.top_p,
+        maxTokens: fullAfter.max_tokens,
+        systemPrompt: fullAfter.system_prompt,
+        toolIds: fullAfter.tool_ids,
+        variables: fullAfter.variables as unknown as Prisma.InputJsonValue,
+        permissionDefault: fullAfter.permission_default,
+        currentVersionId: versionId,
+      },
+    }),
+    prisma.agentVersion.create({
+      data: {
+        id: versionId,
+        agentId: id,
+        version: 1,
+        message: input.message ?? 'Initial version',
+        snapshot: snapshotOf(fullAfter) as unknown as Prisma.InputJsonValue,
+        parentVersionId: null,
+      },
+    }),
+  ]);
+
+  return fullAfter;
+}
+
+export async function getAgentFull(id: string): Promise<AgentFull | null> {
+  const row = await getPrisma().agent.findFirst({
+    where: { id, deletedAt: null },
+  });
+  return row ? rowToAgentFull(row) : null;
+}
+
+export interface PatchAgentInput {
+  name?: string;
+  initial?: string;
+  desc?: string;
+  model?: string;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  system_prompt?: string;
+  variables?: AgentVariable[];
+  tool_ids?: string[];
+  permission_default?: PermissionDefault;
+  message?: string;
+}
+
+/**
+ * Apply a patch to an agent and record a new AgentVersion. The returned
+ * `full` is post-patch; `version` is the row that was just written.
+ * Throws if the agent is missing or soft-deleted.
+ */
+export async function patchAgent(
+  id: string,
+  patch: PatchAgentInput,
+): Promise<{ full: AgentFull; version: AgentVersion }> {
+  const prisma = getPrisma();
+  return prisma.$transaction(async (tx) => {
+    const row = await tx.agent.findFirst({ where: { id, deletedAt: null } });
+    if (!row) throw new Error(`agent ${id} not found`);
+    const current = rowToAgentFull(row);
+    const patched: AgentFull = {
+      ...current,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.initial !== undefined ? { initial: patch.initial } : {}),
+      ...(patch.desc !== undefined ? { desc: patch.desc } : {}),
+      ...(patch.model !== undefined ? { model: patch.model } : {}),
+      ...(patch.temperature !== undefined ? { temperature: patch.temperature } : {}),
+      ...(patch.top_p !== undefined ? { top_p: patch.top_p } : {}),
+      ...(patch.max_tokens !== undefined ? { max_tokens: patch.max_tokens } : {}),
+      ...(patch.system_prompt !== undefined ? { system_prompt: patch.system_prompt } : {}),
+      ...(patch.variables !== undefined ? { variables: patch.variables } : {}),
+      ...(patch.tool_ids !== undefined ? { tool_ids: patch.tool_ids } : {}),
+      ...(patch.permission_default !== undefined
+        ? { permission_default: patch.permission_default }
+        : {}),
+    };
+
+    const prevMax = await tx.agentVersion.findFirst({
+      where: { agentId: id },
+      orderBy: { version: 'desc' },
+      select: { version: true },
+    });
+    const nextVersion = (prevMax?.version ?? 0) + 1;
+    const versionId = newVersionId();
+
+    const created = await tx.agentVersion.create({
+      data: {
+        id: versionId,
+        agentId: id,
+        version: nextVersion,
+        message: patch.message ?? '',
+        snapshot: snapshotOf(patched) as unknown as Prisma.InputJsonValue,
+        parentVersionId: row.currentVersionId,
+      },
+    });
+
+    const updated = await tx.agent.update({
+      where: { id },
+      data: {
+        name: patched.name,
+        initial: patched.initial,
+        description: patched.desc,
+        model: patched.model,
+        temperature: patched.temperature,
+        topP: patched.top_p,
+        maxTokens: patched.max_tokens,
+        systemPrompt: patched.system_prompt,
+        toolIds: patched.tool_ids,
+        variables: patched.variables as unknown as Prisma.InputJsonValue,
+        permissionDefault: patched.permission_default,
+        currentVersionId: versionId,
+      },
+    });
+
+    return {
+      full: rowToAgentFull(updated),
+      version: {
+        id: created.id,
+        agent_id: created.agentId,
+        version: created.version,
+        message: created.message,
+        snapshot: created.snapshot as unknown as AgentVersion['snapshot'],
+        eval_score: created.evalScore,
+        parent_version_id: created.parentVersionId,
+        created_at: created.createdAt.toISOString(),
+      },
+    };
+  });
+}
+
+export async function softDeleteAgent(id: string): Promise<boolean> {
+  try {
+    await getPrisma().agent.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function listAgentVersions(agentId: string): Promise<AgentVersion[]> {
+  const rows = await getPrisma().agentVersion.findMany({
+    where: { agentId },
+    orderBy: { version: 'desc' },
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    agent_id: r.agentId,
+    version: r.version,
+    message: r.message,
+    snapshot: r.snapshot as unknown as AgentVersion['snapshot'],
+    eval_score: r.evalScore,
+    parent_version_id: r.parentVersionId,
+    created_at: r.createdAt.toISOString(),
+  }));
+}
+
+export async function getAgentVersion(
+  agentId: string,
+  version: number,
+): Promise<AgentVersion | null> {
+  const row = await getPrisma().agentVersion.findUnique({
+    where: { agentId_version: { agentId, version } },
+  });
+  if (!row) return null;
+  return {
+    id: row.id,
+    agent_id: row.agentId,
+    version: row.version,
+    message: row.message,
+    snapshot: row.snapshot as unknown as AgentVersion['snapshot'],
+    eval_score: row.evalScore,
+    parent_version_id: row.parentVersionId,
+    created_at: row.createdAt.toISOString(),
+  };
 }
 
 type AgentRow = {
@@ -367,12 +651,15 @@ function agentRowToWire(row: AgentRow): Agent {
 }
 
 export async function listAgents(): Promise<Agent[]> {
-  const rows = await getPrisma().agent.findMany({ orderBy: { id: 'asc' } });
+  const rows = await getPrisma().agent.findMany({
+    where: { deletedAt: null },
+    orderBy: { id: 'asc' },
+  });
   return rows.map(agentRowToWire);
 }
 
 export async function getAgent(id: string): Promise<Agent | null> {
-  const row = await getPrisma().agent.findUnique({ where: { id } });
+  const row = await getPrisma().agent.findFirst({ where: { id, deletedAt: null } });
   return row ? agentRowToWire(row) : null;
 }
 
