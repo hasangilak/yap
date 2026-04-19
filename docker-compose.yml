@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:17-bookworm
+    container_name: yap-postgres
+    environment:
+      POSTGRES_USER: yap
+      POSTGRES_PASSWORD: yap
+      POSTGRES_DB: yap
+    volumes:
+      - yap-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yap -d yap"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
   ollama:
     image: ollama/ollama:latest
     container_name: yap-ollama
@@ -27,26 +44,43 @@ services:
     command: ['ollama pull "${MODEL:-qwen2.5:14b}"']
     restart: "no"
 
+  # One-shot: syncs the Prisma schema to Postgres on every `up`.
+  # Uses `prisma db push` rather than `migrate deploy` while the schema
+  # is still stabilizing; a later phase swaps this for committed
+  # migrations.
+  db-init:
+    build: .
+    container_name: yap-db-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://yap:yap@postgres:5432/yap
+    command: ["pnpm", "db:push"]
+    restart: "no"
+
   yap:
     build: .
     container_name: yap
     depends_on:
+      postgres:
+        condition: service_healthy
       ollama:
         condition: service_healthy
       model-init:
+        condition: service_completed_successfully
+      db-init:
         condition: service_completed_successfully
     environment:
       OLLAMA_HOST: http://ollama:11434
       MODEL: ${MODEL:-qwen2.5:14b}
       PORT: "3001"
       MAX_TOOL_ROUNDS: "8"
-      DB_PATH: /home/yap/app/data/yap.db
+      DATABASE_URL: postgres://yap:yap@postgres:5432/yap
     ports:
       - "3001:3001"
-    volumes:
-      - yap-data:/home/yap/app/data
     restart: unless-stopped
 
 volumes:
   ollama-models:
-  yap-data:
+  yap-postgres:

@@ -8,14 +8,18 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "NODE_OPTIONS=--experimental-sqlite tsx watch src/server.ts",
-    "start": "NODE_OPTIONS=--experimental-sqlite tsx src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push --accept-data-loss",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@ag-ui/core": "^0.0.52",
     "@ag-ui/encoder": "^0.0.52",
     "@hono/node-server": "^1.19.14",
+    "@prisma/client": "6",
     "chrome-less": "github:hasangilak/chrome-cli",
     "hono": "^4.12.14",
     "ollama": "^0.6.3",
@@ -23,6 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "prisma": "6",
     "tsx": "^4.21.0",
     "typescript": "^5.7.2"
   }

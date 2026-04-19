@@ -6,4 +6,5 @@ dist
 *.log
 .claude/
 data/
+prisma/migrations
 

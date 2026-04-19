@@ -5,12 +5,14 @@ FROM node:22-bookworm-slim
 #   git        — required so pnpm can resolve the `github:` dep
 #   tini       — clean PID-1 that reaps the chrome + chrome-less children
 #   fonts      — so pages render text; saves "missing glyph" boxes in a11y
+#   openssl    — required by Prisma's binary engine at runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       chromium \
       ca-certificates \
       fonts-noto-core \
       git \
+      openssl \
       tini \
  && rm -rf /var/lib/apt/lists/*
 
@@ -30,19 +32,16 @@ ENV NODE_ENV=production \
     OLLAMA_HOST=http://ollama:11434 \
     MODEL=qwen2.5:14b \
     CHROME_LESS_CHROME=/usr/bin/chromium \
-    MAX_TOOL_ROUNDS=8 \
-    DB_PATH=/home/yap/app/data/yap.db \
-    NODE_OPTIONS=--experimental-sqlite
+    MAX_TOOL_ROUNDS=8
 
 # Install dependencies first so the layer caches on source-only edits.
+# `postinstall` runs `prisma generate` to produce the typed client.
 COPY --chown=yap:yap package.json pnpm-lock.yaml* ./
+COPY --chown=yap:yap prisma ./prisma
 RUN pnpm install --prod=false
 
 COPY --chown=yap:yap tsconfig.json ./
 COPY --chown=yap:yap src ./src
-
-# SQLite DB lives here; mounted as a named volume in docker-compose.
-RUN mkdir -p /home/yap/app/data
 
 EXPOSE 3001
 

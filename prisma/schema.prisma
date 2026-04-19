@@ -1,0 +1,95 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Chat-box conversation. The wire shape exposed at /api/v1/conversations
+/// has a display-name `agent` field and a display-string `updated` field;
+/// those are computed from `agentId` (via Agent.name) and `updatedAt`.
+model Conversation {
+  id             String   @id
+  title          String
+  snippet        String   @default("")
+  agentId        String   @map("agent_id")
+  tag            String?
+  pinned         Boolean  @default(false)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+  rootNodeId     String?  @map("root_node_id")
+  activeLeafId   String?  @map("active_leaf_id")
+  tokenBudget    Int      @default(200000) @map("token_budget")
+  tokensUsed     Int      @default(0)      @map("tokens_used")
+
+  nodes  Node[]
+  events Event[]
+
+  @@index([pinned(sort: Desc), updatedAt(sort: Desc)])
+  @@map("conversations")
+}
+
+/// One message in the conversation tree. The wire shape omits several
+/// server-internal fields (parent_id → parent, edited_from_id absent).
+/// `role` is strictly 'user' | 'asst' — client does not accept
+/// 'assistant'.
+model Node {
+  id             String   @id
+  conversationId String   @map("conversation_id")
+  parentId       String?  @map("parent_id")
+  role           String
+  branch         String   @default("main")
+  content        String   @default("")
+  reasoning      Json?
+  toolCall       Json?    @map("tool_call")
+  clarify        Json?
+  approval       Json?
+  streaming      Boolean  @default(false)
+  status         String?
+  edited         Boolean  @default(false)
+  editedFromId   String?  @map("edited_from_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, branch, createdAt])
+  @@map("nodes")
+}
+
+/// Wire Agent is { id, name, initial, desc, model, tools: number, temp }.
+/// `tools` on the wire is a COUNT derived from toolIds length; the model
+/// keeps the full array. Builder-form fields (systemPrompt etc.) stay
+/// server-side until Phase 4 adds the builder endpoints.
+model Agent {
+  id            String  @id
+  name          String
+  initial       String
+  description   String  @default("")
+  model         String
+  temperature   Float   @default(0.5)
+  topP          Float   @default(1.0) @map("top_p")
+  maxTokens     Int     @default(4096) @map("max_tokens")
+  systemPrompt  String  @default("") @map("system_prompt")
+  toolIds       Json    @default("[]") @map("tool_ids")
+
+  @@map("agents")
+}
+
+/// Every BusEvent persisted before publication, so the SSE stream can
+/// be resumed with ?since_event=<id>.
+model Event {
+  seq             BigInt   @id @default(autoincrement())
+  id              String   @unique
+  conversationId  String   @map("conversation_id")
+  nodeId          String?  @map("node_id")
+  kind            String
+  payload         Json
+  at              DateTime
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, seq])
+  @@map("events")
+}
