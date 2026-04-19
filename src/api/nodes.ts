@@ -3,8 +3,12 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { getPrisma } from '../db/index.js';
 import {
+  deleteSubtree,
+  getConversationRaw,
   insertNode,
+  listDescendantIds,
   nextBranchName,
+  rippleCounts,
   updateConversationPointers,
 } from '../db/queries.js';
 import { publish } from '../events/bus.js';
@@ -150,3 +154,131 @@ nodesRouter.post('/:id/regenerate', async (c) => {
 
   return c.json(asstNode, 201);
 });
+
+/**
+ * POST /api/v1/nodes/:id/branch
+ *
+ * Spec §3.3. Creates an empty user node as a sibling of :id on a
+ * fresh alt-N branch and moves active_leaf_id to it. The client's
+ * composer focuses after this call so the user can fill in the text
+ * themselves — no assistant reply is kicked off.
+ */
+nodesRouter.post('/:id/branch', async (c) => {
+  const id = c.req.param('id');
+  const orig = await getPrisma().node.findUnique({ where: { id } });
+  if (!orig) return c.json({ error: 'not found' }, 404);
+
+  const conversationId = orig.conversationId;
+  const branch = await nextBranchName(conversationId);
+  const newId = newNodeId();
+
+  const newNode = await insertNode({
+    id: newId,
+    conversation_id: conversationId,
+    parent_id: orig.parentId,
+    role: 'user',
+    branch,
+    content: '',
+  });
+
+  await publish({
+    kind: 'node.created',
+    ...envelope(conversationId),
+    node: newNode,
+  });
+  await updateConversationPointers(conversationId, {
+    active_leaf_id: newId,
+    updated_at: new Date(),
+  });
+  await publish({
+    kind: 'active_leaf.changed',
+    ...envelope(conversationId),
+    active_leaf_id: newId,
+  });
+
+  return c.json(newNode, 201);
+});
+
+/**
+ * DELETE /api/v1/nodes/:id?subtree=true[&fallback_leaf=<id>]
+ *
+ * Spec §3.5. Irreversibly removes the subtree rooted at :id. If the
+ * conversation's active_leaf is in that subtree the caller MUST
+ * provide a fallback_leaf query param so the conversation still
+ * points at something reachable from the root. Returns the count of
+ * nodes removed.
+ */
+nodesRouter.delete('/:id', async (c) => {
+  const id = c.req.param('id');
+  const subtree = c.req.query('subtree') === 'true';
+  if (!subtree) {
+    return c.json({ error: 'only subtree deletion is supported in Phase 3' }, 400);
+  }
+
+  const orig = await getPrisma().node.findUnique({ where: { id } });
+  if (!orig) return c.json({ error: 'not found' }, 404);
+  const conversationId = orig.conversationId;
+
+  const conv = await getConversationRaw(conversationId);
+  if (!conv) return c.json({ error: 'conversation missing' }, 500);
+
+  const descIds = await listDescendantIds(conversationId, id);
+  const subtreeIds = new Set([id, ...descIds]);
+  const activeLeafInside =
+    conv.activeLeafId != null && subtreeIds.has(conv.activeLeafId);
+  const rootInside =
+    conv.rootNodeId != null && subtreeIds.has(conv.rootNodeId);
+
+  const fallback = c.req.query('fallback_leaf') ?? null;
+  if (activeLeafInside && !fallback) {
+    return c.json(
+      { error: 'active_leaf_id is inside the subtree; pass ?fallback_leaf=<id>' },
+      409,
+    );
+  }
+  if (fallback) {
+    const fb = await getPrisma().node.findUnique({ where: { id: fallback } });
+    if (!fb || fb.conversationId !== conversationId || subtreeIds.has(fb.id)) {
+      return c.json({ error: 'invalid fallback_leaf' }, 400);
+    }
+  }
+
+  const removed = await deleteSubtree(conversationId, id);
+
+  // Fix up pointers. active_leaf moves to fallback; root is the trickier
+  // case — Phase 3 doesn't expose a re-parent op, so deleting the root
+  // leaves the conversation empty and we null both pointers.
+  if (activeLeafInside || rootInside) {
+    await updateConversationPointers(conversationId, {
+      active_leaf_id: activeLeafInside ? fallback : conv.activeLeafId,
+      root_node_id: rootInside ? null : conv.rootNodeId,
+      updated_at: new Date(),
+    });
+    if (activeLeafInside) {
+      await publish({
+        kind: 'active_leaf.changed',
+        ...envelope(conversationId),
+        active_leaf_id: fallback!,
+      });
+    }
+  }
+
+  return c.json({ ok: true, removed });
+});
+
+/**
+ * GET /api/v1/nodes/:id/ripple-preview
+ *
+ * Spec §3.6. Returns how many descendants exist under :id, how many
+ * tool calls would need to be replayed, and how many new approvals
+ * the ripple would request. Used by the edit dialog before the user
+ * decides whether to tick "regenerate descendants".
+ */
+nodesRouter.get('/:id/ripple-preview', async (c) => {
+  const id = c.req.param('id');
+  const orig = await getPrisma().node.findUnique({ where: { id } });
+  if (!orig) return c.json({ error: 'not found' }, 404);
+  const counts = await rippleCounts(orig.conversationId, id);
+  return c.json(counts);
+});
+
