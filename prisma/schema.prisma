@@ -132,6 +132,25 @@ model Approval {
   @@map("approvals")
 }
 
+/// Phase 5a: one row per ask_clarification tool call that's waiting
+/// on a structured user answer. `response` holds the selected chip
+/// ids + free-form text once the user hits Send via
+/// POST /clarify/:id/answer.
+model Clarify {
+  id             String    @id
+  conversationId String    @map("conversation_id")
+  nodeId         String    @map("node_id")
+  question       String
+  chips          Json
+  inputHint      String    @default("") @map("input_hint")
+  response       Json?
+  respondedAt    DateTime? @map("responded_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([conversationId])
+  @@map("clarifications")
+}
+
 /// Phase 2: persistent "allow always" grants keyed by (user, agent, tool).
 /// userId is hardcoded 'local' until the multi-user phase lands.
 model ApprovalGrant {

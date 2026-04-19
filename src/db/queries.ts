@@ -8,7 +8,9 @@ import type {
   AgentVersion,
   ApprovalData,
   BusEvent,
+  ClarifyChip,
   ClarifyData,
+  ClarifyResponse,
   Conversation,
   Decision,
   MessageNode,
@@ -687,6 +689,71 @@ export async function insertEvent(ev: BusEvent): Promise<void> {
       kind: ev.kind,
       payload: ev as unknown as Prisma.InputJsonValue,
       at: new Date(ev.at),
+    },
+  });
+}
+
+// -- clarifications (Phase 5a) -------------------------------------------------
+
+export interface InsertClarifyInput {
+  id: string;
+  conversation_id: string;
+  node_id: string;
+  question: string;
+  chips: ClarifyChip[];
+  input_hint: string;
+}
+
+export async function insertClarify(input: InsertClarifyInput): Promise<void> {
+  await getPrisma().clarify.create({
+    data: {
+      id: input.id,
+      conversationId: input.conversation_id,
+      nodeId: input.node_id,
+      question: input.question,
+      chips: input.chips as unknown as Prisma.InputJsonValue,
+      inputHint: input.input_hint,
+    },
+  });
+}
+
+export interface ClarifyRow {
+  id: string;
+  conversationId: string;
+  nodeId: string;
+  question: string;
+  chips: ClarifyChip[];
+  inputHint: string;
+  response: ClarifyResponse | null;
+  respondedAt: Date | null;
+  createdAt: Date;
+}
+
+export async function getClarify(id: string): Promise<ClarifyRow | null> {
+  const row = await getPrisma().clarify.findUnique({ where: { id } });
+  if (!row) return null;
+  return {
+    id: row.id,
+    conversationId: row.conversationId,
+    nodeId: row.nodeId,
+    question: row.question,
+    chips: (row.chips ?? []) as unknown as ClarifyChip[],
+    inputHint: row.inputHint,
+    response: (row.response ?? null) as unknown as ClarifyResponse | null,
+    respondedAt: row.respondedAt,
+    createdAt: row.createdAt,
+  };
+}
+
+export async function recordClarifyResponse(
+  id: string,
+  response: ClarifyResponse,
+): Promise<void> {
+  await getPrisma().clarify.update({
+    where: { id },
+    data: {
+      response: response as unknown as Prisma.InputJsonValue,
+      respondedAt: new Date(),
     },
   });
 }

@@ -94,6 +94,34 @@ export const ApprovalDecidedEventSchema = Base.extend({
   decision: DecisionSchema,
 });
 
+export const ClarifyResponseSchema = z.object({
+  selected_chip_ids: z.array(z.string()),
+  text: z.string(),
+});
+export type ClarifyResponse = z.infer<typeof ClarifyResponseSchema>;
+
+export const ClarifyRequestedEventSchema = Base.extend({
+  kind: z.literal('clarify.requested'),
+  node_id: z.string(),
+  clarify_id: z.string(),
+  clarify: z.object({
+    question: z.string(),
+    chips: z.array(z.object({
+      id: z.string(),
+      label: z.string(),
+      selected: z.boolean().optional(),
+    })),
+    input: z.string(),
+  }),
+});
+
+export const ClarifyAnsweredEventSchema = Base.extend({
+  kind: z.literal('clarify.answered'),
+  node_id: z.string(),
+  clarify_id: z.string(),
+  response: ClarifyResponseSchema,
+});
+
 export const ErrorEventSchema = Base.extend({
   kind: z.literal('error'),
   node_id: z.string().optional(),
@@ -112,6 +140,8 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ToolCallEndedEventSchema,
   ApprovalRequestedEventSchema,
   ApprovalDecidedEventSchema,
+  ClarifyRequestedEventSchema,
+  ClarifyAnsweredEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,
