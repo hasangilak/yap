@@ -9,7 +9,7 @@ import {
   listArtifactsByConversation,
   listConversations,
 } from '../db/queries.js';
-import { CreateConversationRequestSchema } from '../schemas/index.js';
+import { AttachTagRequestSchema, CreateConversationRequestSchema } from '../schemas/index.js';
 
 export const conversationsRouter = new Hono();
 
@@ -61,4 +61,39 @@ conversationsRouter.get('/:id/tree', async (c) => {
 conversationsRouter.get('/:id/artifacts', async (c) => {
   const rows = await listArtifactsByConversation(c.req.param('id'));
   return c.json(rows);
+});
+
+// -- tag attach / detach (Phase 7) ----------------------------------------
+
+conversationsRouter.post('/:id/tags', async (c) => {
+  const convId = c.req.param('id');
+  const body = AttachTagRequestSchema.parse(await c.req.json());
+  const prisma = getPrisma();
+
+  let tagId = body.tag_id;
+  if (!tagId && body.name) {
+    const row = await prisma.tag.findUnique({ where: { name: body.name } });
+    if (!row) return c.json({ error: 'tag not found (create it first)' }, 404);
+    tagId = row.id;
+  }
+
+  await prisma.conversationTag.upsert({
+    where: { conversationId_tagId: { conversationId: convId, tagId: tagId! } },
+    update: {},
+    create: { conversationId: convId, tagId: tagId! },
+  });
+  return c.json({ ok: true, tag_id: tagId });
+});
+
+conversationsRouter.delete('/:id/tags/:tagId', async (c) => {
+  const convId = c.req.param('id');
+  const tagId = c.req.param('tagId');
+  try {
+    await getPrisma().conversationTag.delete({
+      where: { conversationId_tagId: { conversationId: convId, tagId } },
+    });
+    return c.json({ ok: true });
+  } catch {
+    return c.json({ error: 'not attached' }, 404);
+  }
 });

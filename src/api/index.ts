@@ -9,6 +9,7 @@ import { devRouter } from './dev.js';
 import { messagesRouter } from './messages.js';
 import { nodesRouter } from './nodes.js';
 import { streamRouter } from './stream.js';
+import { tagsRouter } from './tags.js';
 import { toolsRouter } from './tools.js';
 
 export const apiV1 = new Hono();
@@ -22,6 +23,7 @@ apiV1.route('/conversations', conversationsRouter);
 apiV1.route('/agents', agentsRouter);
 apiV1.route('/agent-templates', templatesRouter);
 apiV1.route('/tools', toolsRouter);
+apiV1.route('/tags', tagsRouter);
 apiV1.route('/approvals', approvalsRouter);
 apiV1.route('/clarify', clarifyRouter);
 apiV1.route('/artifacts', artifactsRouter);
