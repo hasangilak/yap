@@ -7,6 +7,9 @@ import type {
   AgentVariable,
   AgentVersion,
   ApprovalData,
+  Artifact,
+  ArtifactAuthor,
+  ArtifactVersion,
   BusEvent,
   ClarifyChip,
   ClarifyData,
@@ -691,6 +694,197 @@ export async function insertEvent(ev: BusEvent): Promise<void> {
       at: new Date(ev.at),
     },
   });
+}
+
+// -- artifacts (Phase 6) -------------------------------------------------------
+
+const MIME_BY_EXT: Record<string, string> = {
+  '.ts': 'text/typescript',
+  '.tsx': 'text/tsx',
+  '.js': 'text/javascript',
+  '.jsx': 'text/jsx',
+  '.mjs': 'text/javascript',
+  '.cjs': 'text/javascript',
+  '.py': 'text/python',
+  '.rs': 'text/rust',
+  '.go': 'text/go',
+  '.java': 'text/java',
+  '.rb': 'text/ruby',
+  '.sh': 'text/shell',
+  '.md': 'text/markdown',
+  '.txt': 'text/plain',
+  '.json': 'application/json',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
+  '.toml': 'application/toml',
+  '.html': 'text/html',
+  '.css': 'text/css',
+  '.sql': 'application/sql',
+};
+
+function inferMime(path: string): string {
+  const lower = path.toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  if (dot < 0) return 'text/plain';
+  return MIME_BY_EXT[lower.slice(dot)] ?? 'text/plain';
+}
+
+function newArtifactId(): string {
+  return `art-${randomUUID().slice(0, 8)}`;
+}
+
+function newArtifactVersionId(): string {
+  return `artv-${randomUUID().slice(0, 8)}`;
+}
+
+function rowToArtifact(row: {
+  id: string;
+  conversationId: string;
+  title: string;
+  mime: string;
+  currentVersionId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}): Artifact {
+  return {
+    id: row.id,
+    conversation_id: row.conversationId,
+    title: row.title,
+    mime: row.mime,
+    current_version_id: row.currentVersionId,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+  };
+}
+
+function rowToArtifactVersion(row: {
+  id: string;
+  artifactId: string;
+  version: number;
+  content: string;
+  diffFrom: string | null;
+  message: string;
+  author: string;
+  producedByNodeId: string | null;
+  createdAt: Date;
+}): ArtifactVersion {
+  return {
+    id: row.id,
+    artifact_id: row.artifactId,
+    version: row.version,
+    content: row.content,
+    diff_from: row.diffFrom,
+    message: row.message,
+    author: row.author as ArtifactAuthor,
+    produced_by_node_id: row.producedByNodeId,
+    created_at: row.createdAt.toISOString(),
+  };
+}
+
+/**
+ * Record a write_file as an artifact version. Creates the Artifact
+ * if this (conversation, path) pair has never been written before,
+ * else appends a new version to the existing artifact. Runs as a
+ * single transaction so artifact.current_version_id and the new
+ * version row commit together.
+ */
+export async function recordArtifactWrite(input: {
+  conversation_id: string;
+  title: string;
+  content: string;
+  author: ArtifactAuthor;
+  produced_by_node_id: string | null;
+  message?: string;
+}): Promise<{ artifact: Artifact; version: ArtifactVersion }> {
+  const prisma = getPrisma();
+  return prisma.$transaction(async (tx) => {
+    const existing = await tx.artifact.findUnique({
+      where: {
+        conversationId_title: {
+          conversationId: input.conversation_id,
+          title: input.title,
+        },
+      },
+    });
+
+    let artifactId = existing?.id;
+    let mime = existing?.mime ?? inferMime(input.title);
+
+    if (!existing) {
+      artifactId = newArtifactId();
+      await tx.artifact.create({
+        data: {
+          id: artifactId,
+          conversationId: input.conversation_id,
+          title: input.title,
+          mime,
+        },
+      });
+    }
+
+    const prevMax = await tx.artifactVersion.findFirst({
+      where: { artifactId },
+      orderBy: { version: 'desc' },
+      select: { version: true, id: true },
+    });
+
+    const nextVersion = (prevMax?.version ?? 0) + 1;
+    const versionId = newArtifactVersionId();
+
+    const created = await tx.artifactVersion.create({
+      data: {
+        id: versionId,
+        artifactId: artifactId!,
+        version: nextVersion,
+        content: input.content,
+        diffFrom: prevMax?.id ?? null,
+        message: input.message ?? '',
+        author: input.author,
+        producedByNodeId: input.produced_by_node_id,
+      },
+    });
+
+    const updatedArtifact = await tx.artifact.update({
+      where: { id: artifactId! },
+      data: { currentVersionId: versionId, mime },
+    });
+
+    return {
+      artifact: rowToArtifact(updatedArtifact),
+      version: rowToArtifactVersion(created),
+    };
+  });
+}
+
+export async function listArtifactsByConversation(conversationId: string): Promise<Artifact[]> {
+  const rows = await getPrisma().artifact.findMany({
+    where: { conversationId },
+    orderBy: { updatedAt: 'desc' },
+  });
+  return rows.map(rowToArtifact);
+}
+
+export async function getArtifact(id: string): Promise<Artifact | null> {
+  const row = await getPrisma().artifact.findUnique({ where: { id } });
+  return row ? rowToArtifact(row) : null;
+}
+
+export async function listArtifactVersions(artifactId: string): Promise<ArtifactVersion[]> {
+  const rows = await getPrisma().artifactVersion.findMany({
+    where: { artifactId },
+    orderBy: { version: 'desc' },
+  });
+  return rows.map(rowToArtifactVersion);
+}
+
+export async function getArtifactVersion(
+  artifactId: string,
+  version: number,
+): Promise<ArtifactVersion | null> {
+  const row = await getPrisma().artifactVersion.findUnique({
+    where: { artifactId_version: { artifactId, version } },
+  });
+  return row ? rowToArtifactVersion(row) : null;
 }
 
 // -- clarifications (Phase 5a) -------------------------------------------------
