@@ -122,6 +122,14 @@ export const ClarifyAnsweredEventSchema = Base.extend({
   response: ClarifyResponseSchema,
 });
 
+export const ArtifactUpdatedEventSchema = Base.extend({
+  kind: z.literal('artifact.updated'),
+  artifact_id: z.string(),
+  version_id: z.string(),
+  version: z.number().int().positive(),
+  title: z.string(),
+});
+
 export const ErrorEventSchema = Base.extend({
   kind: z.literal('error'),
   node_id: z.string().optional(),
@@ -142,6 +150,7 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ApprovalDecidedEventSchema,
   ClarifyRequestedEventSchema,
   ClarifyAnsweredEventSchema,
+  ArtifactUpdatedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,

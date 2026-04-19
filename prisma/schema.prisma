@@ -163,6 +163,48 @@ model ApprovalGrant {
   @@map("approval_grants")
 }
 
+/// Phase 6: one Artifact per (conversation, path). Every write_file
+/// call that hits an existing (conv, path) appends a new version; a
+/// fresh path starts a new artifact row. title mirrors the path today
+/// because there's no rename-path UI yet.
+model Artifact {
+  id               String    @id
+  conversationId   String    @map("conversation_id")
+  title            String
+  mime             String    @default("text/plain")
+  currentVersionId String?   @map("current_version_id")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  versions ArtifactVersion[]
+
+  @@unique([conversationId, title])
+  @@index([conversationId])
+  @@map("artifacts")
+}
+
+/// Phase 6: immutable snapshot of artifact content at save time.
+/// version is monotonic per-artifact starting at 1. author is 'asst'
+/// for tool-call-produced versions and 'user' when a later phase
+/// adds direct user edits.
+model ArtifactVersion {
+  id                 String   @id
+  artifactId         String   @map("artifact_id")
+  version            Int
+  content            String
+  diffFrom           String?  @map("diff_from")
+  message            String   @default("")
+  author             String
+  producedByNodeId   String?  @map("produced_by_node_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  artifact Artifact @relation(fields: [artifactId], references: [id], onDelete: Cascade)
+
+  @@unique([artifactId, version])
+  @@index([artifactId])
+  @@map("artifact_versions")
+}
+
 /// Every BusEvent persisted before publication, so the SSE stream can
 /// be resumed with ?since_event=<id>.
 model Event {
