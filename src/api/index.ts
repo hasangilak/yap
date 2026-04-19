@@ -1,9 +1,16 @@
 import { Hono } from 'hono';
 import { agentsRouter } from './agents.js';
 import { conversationsRouter } from './conversations.js';
+import { messagesRouter } from './messages.js';
+import { streamRouter } from './stream.js';
 import { toolsRouter } from './tools.js';
 
 export const apiV1 = new Hono();
+
+// The write/stream routes reference :id under /conversations and so are
+// mounted at the v1 root; Hono's route matching handles the overlap.
+apiV1.route('/', messagesRouter);
+apiV1.route('/', streamRouter);
 
 apiV1.route('/conversations', conversationsRouter);
 apiV1.route('/agents', agentsRouter);
