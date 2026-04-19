@@ -404,6 +404,105 @@ export async function insertEvent(ev: BusEvent): Promise<void> {
   });
 }
 
+// -- tree operations (Phase 3) -------------------------------------------------
+
+/**
+ * Pick the next available `alt-N` branch label for this conversation.
+ * Branches are never renamed, so the server just scans the highest
+ * existing `alt-N` and increments. Returns "alt-1" if the conversation
+ * has never branched.
+ */
+export async function nextBranchName(conversationId: string): Promise<string> {
+  const rows = await getPrisma().node.findMany({
+    where: { conversationId, branch: { startsWith: 'alt-' } },
+    select: { branch: true },
+  });
+  let max = 0;
+  for (const r of rows) {
+    const m = r.branch.match(/^alt-(\d+)$/);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `alt-${max + 1}`;
+}
+
+/**
+ * All node ids in the subtree rooted at `nodeId`, excluding the root
+ * itself. Walks the tree programmatically (no recursive CTE) because
+ * Phase 1 trees are small and Prisma's raw SQL escape hatch isn't
+ * worth the portability cost here.
+ */
+export async function listDescendantIds(
+  conversationId: string,
+  nodeId: string,
+): Promise<string[]> {
+  const prisma = getPrisma();
+  const all = await prisma.node.findMany({
+    where: { conversationId },
+    select: { id: true, parentId: true },
+  });
+  const children = new Map<string, string[]>();
+  for (const n of all) {
+    if (!n.parentId) continue;
+    const list = children.get(n.parentId) ?? [];
+    list.push(n.id);
+    children.set(n.parentId, list);
+  }
+  const out: string[] = [];
+  const stack: string[] = [nodeId];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    const kids = children.get(cur) ?? [];
+    for (const k of kids) {
+      out.push(k);
+      stack.push(k);
+    }
+  }
+  return out;
+}
+
+/**
+ * Delete a node and its entire subtree. Returns the count of rows
+ * removed (root included). Does not touch the conversation's
+ * root_node_id / active_leaf_id — the caller is responsible for fixing
+ * those pointers if they land inside the deleted set.
+ */
+export async function deleteSubtree(
+  conversationId: string,
+  rootId: string,
+): Promise<number> {
+  const descendants = await listDescendantIds(conversationId, rootId);
+  const ids = [rootId, ...descendants];
+  const { count } = await getPrisma().node.deleteMany({
+    where: { id: { in: ids } },
+  });
+  return count;
+}
+
+/**
+ * Metadata for ripple-preview: which descendants have tool calls or
+ * approvals attached, and how many total nodes would be replayed.
+ */
+export async function rippleCounts(
+  conversationId: string,
+  nodeId: string,
+): Promise<{ descendant_count: number; tool_calls_to_replay: number; approvals_required: number }> {
+  const ids = await listDescendantIds(conversationId, nodeId);
+  if (ids.length === 0) {
+    return { descendant_count: 0, tool_calls_to_replay: 0, approvals_required: 0 };
+  }
+  const rows = await getPrisma().node.findMany({
+    where: { id: { in: ids } },
+    select: { toolCall: true, approval: true },
+  });
+  let tools = 0;
+  let approvals = 0;
+  for (const r of rows) {
+    if (r.toolCall) tools++;
+    if (r.approval) approvals++;
+  }
+  return { descendant_count: ids.length, tool_calls_to_replay: tools, approvals_required: approvals };
+}
+
 // -- approvals (Phase 2) -------------------------------------------------------
 
 export interface InsertApprovalInput {
