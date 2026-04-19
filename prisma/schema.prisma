@@ -60,8 +60,8 @@ model Node {
 
 /// Wire Agent is { id, name, initial, desc, model, tools: number, temp }.
 /// `tools` on the wire is a COUNT derived from toolIds length; the model
-/// keeps the full array. Builder-form fields (systemPrompt etc.) stay
-/// server-side until Phase 4 adds the builder endpoints.
+/// keeps the full array. Builder-form fields (systemPrompt etc.) are
+/// surfaced via GET /agents/:id/full and editable via PATCH.
 model Agent {
   id                String  @id
   name              String
@@ -73,11 +73,40 @@ model Agent {
   maxTokens         Int     @default(4096) @map("max_tokens")
   systemPrompt      String  @default("") @map("system_prompt")
   toolIds           Json    @default("[]") @map("tool_ids")
+  variables         Json    @default("[]")
   /// Phase 2: one of 'ask_every_time' | 'auto_allow_read' | 'auto_allow_all'.
   /// Drives whether a tool call needs an approval round-trip.
   permissionDefault String  @default("ask_every_time") @map("permission_default")
+  /// Phase 4: id of the AgentVersion that represents the current saved
+  /// state. Updated on every PATCH that writes a new version.
+  currentVersionId  String? @map("current_version_id")
+  /// Phase 4: soft-delete marker. Rows with a non-null deletedAt are
+  /// hidden from listings but kept around so version history survives.
+  deletedAt         DateTime? @map("deleted_at")
+
+  versions          AgentVersion[]
 
   @@map("agents")
+}
+
+/// Phase 4: every PATCH /agents/:id that changes agent state writes
+/// one of these. snapshot is the full materialized Agent at save time;
+/// version is a monotonic per-agent integer starting at 1.
+model AgentVersion {
+  id              String   @id
+  agentId         String   @map("agent_id")
+  version         Int
+  message         String   @default("")
+  snapshot        Json
+  evalScore       Float?   @map("eval_score")
+  parentVersionId String?  @map("parent_version_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, version])
+  @@index([agentId])
+  @@map("agent_versions")
 }
 
 /// Phase 2: one row per proposed tool call that needs user approval.
