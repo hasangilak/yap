@@ -16,17 +16,20 @@ const HEARTBEAT_MS = 15_000;
 /**
  * GET /api/v1/conversations/:id/stream[?since_event=<id>]
  *
- * Server-Sent Events channel carrying every BusEvent emitted by the
- * runtime for this conversation. On open:
+ * Subscribe-first, replay-after, dedupe-by-id — the race window that
+ * existed through Phase 1 is closed here:
  *
- *   1. Any events already in the DB after `since_event` are flushed
- *      (reconnect replay).
- *   2. A live subscription drains to the wire.
+ *   1. Subscribe to the bus into a buffer BEFORE querying the DB.
+ *   2. Replay persisted events since `since_event` (or from the start)
+ *      to the wire, recording every id we emitted.
+ *   3. Flush the buffer, dropping any event whose id was already seen
+ *      during replay.
+ *   4. Switch to a live pump.
  *
- * A tiny race window exists between replay-finished and subscribe-
- * active; Phase 1 ignores it because events only flow in response to
- * POST /messages calls the client initiates itself. A later phase can
- * tighten this by subscribing first and deduping by event.id.
+ * Any event produced between replay-end and subscribe-active in the
+ * old design would have been lost; subscribe-first makes that window
+ * empty. A 15s heartbeat keeps intermediaries from idling the stream
+ * shut; abort cleans up subscription + heartbeat together.
  */
 streamRouter.get('/conversations/:id/stream', async (c) => {
   const id = c.req.param('id');
@@ -41,19 +44,20 @@ streamRouter.get('/conversations/:id/stream', async (c) => {
   c.header('X-Accel-Buffering', 'no');
 
   return stream(c, async (s) => {
-    // Replay anything the caller missed.
-    const replayed = await listEventsSince(id, since);
-    for (const ev of replayed) {
-      await s.write(encodeSSE(ev));
-    }
-
-    // Live subscription backed by a simple queue + promise.
-    const queue: BusEvent[] = [];
+    // 1. Subscribe first — accumulate live events into a buffer while
+    //    we run the historical replay query.
+    const preReplayBuffer: BusEvent[] = [];
+    const liveQueue: BusEvent[] = [];
+    let handoff = false;
     let wake: (() => void) | null = null;
 
     const unsubscribe = subscribe(id, (ev) => {
-      queue.push(ev);
-      if (wake) { wake(); wake = null; }
+      if (handoff) {
+        liveQueue.push(ev);
+        if (wake) { wake(); wake = null; }
+      } else {
+        preReplayBuffer.push(ev);
+      }
     });
 
     s.onAbort(() => {
@@ -66,13 +70,37 @@ streamRouter.get('/conversations/:id/stream', async (c) => {
     }, HEARTBEAT_MS);
 
     try {
+      // 2. Flush historical events since the client's cursor.
+      const replayed = await listEventsSince(id, since);
+      const seen = new Set<string>();
+      for (const ev of replayed) {
+        seen.add(ev.id);
+        await s.write(encodeSSE(ev));
+      }
+
+      // 3. Flush anything that arrived while we were replaying,
+      //    dropping events whose ids were already covered by the
+      //    replay.
+      for (const ev of preReplayBuffer) {
+        if (seen.has(ev.id)) continue;
+        seen.add(ev.id);
+        await s.write(encodeSSE(ev));
+      }
+      handoff = true;
+
+      // 4. Live pump.
       while (!s.aborted) {
-        const ev = queue.shift();
+        const ev = liveQueue.shift();
         if (ev) {
-          await s.write(encodeSSE(ev));
+          if (!seen.has(ev.id)) {
+            seen.add(ev.id);
+            await s.write(encodeSSE(ev));
+          }
           continue;
         }
-        await new Promise<void>((resolve) => { wake = resolve; });
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
       }
     } finally {
       clearInterval(heartbeat);
