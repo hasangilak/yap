@@ -6,6 +6,8 @@ services:
       POSTGRES_USER: yap
       POSTGRES_PASSWORD: yap
       POSTGRES_DB: yap
+    ports:
+      - "5432:5432"
     volumes:
       - yap-postgres:/var/lib/postgresql/data
     healthcheck:
