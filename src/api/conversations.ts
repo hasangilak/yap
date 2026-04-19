@@ -6,6 +6,7 @@ import {
   getConversation,
   getConversationTree,
   insertConversation,
+  listArtifactsByConversation,
   listConversations,
 } from '../db/queries.js';
 import { CreateConversationRequestSchema } from '../schemas/index.js';
@@ -55,4 +56,9 @@ conversationsRouter.get('/:id/tree', async (c) => {
   const tree = await getConversationTree(c.req.param('id'));
   if (!tree) return c.json({ error: 'not found' }, 404);
   return c.json(tree);
+});
+
+conversationsRouter.get('/:id/artifacts', async (c) => {
+  const rows = await listArtifactsByConversation(c.req.param('id'));
+  return c.json(rows);
 });

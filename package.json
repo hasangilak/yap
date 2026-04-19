@@ -21,11 +21,13 @@
     "@hono/node-server": "^1.19.14",
     "@prisma/client": "6",
     "chrome-less": "github:hasangilak/chrome-cli",
+    "diff": "^9.0.0",
     "hono": "^4.12.14",
     "ollama": "^0.6.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/diff": "^8.0.0",
     "@types/node": "^22.10.0",
     "prisma": "6",
     "tsx": "^4.21.0",
