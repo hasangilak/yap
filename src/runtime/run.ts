@@ -166,6 +166,19 @@ export async function* runAssistantTurn(input: {
     return;
   }
 
+  // Phase 8: hard-stop before starting a turn if the conversation has
+  // already exhausted its budget. Non-recoverable — client must bump
+  // the budget (Phase 4+) to continue.
+  if (conv.tokensUsed >= conv.tokenBudget) {
+    yield {
+      kind: 'error',
+      ...envelope(conversationId),
+      message: `token budget exhausted (${conv.tokensUsed} / ${conv.tokenBudget})`,
+      recoverable: false,
+    };
+    return;
+  }
+
   const agent = await getAgentRaw(conv.agentId);
   const model = agent?.model ?? config.defaultModel;
   const systemPrompt = (agent?.systemPrompt && agent.systemPrompt.trim())
@@ -267,26 +280,59 @@ export async function* runAssistantTurn(input: {
         stream: true,
       });
 
-      for await (const part of stream) {
-        const delta = part.message?.content;
-        if (delta) {
-          for (const ev of dispatch(splitter.feed(delta))) yield ev;
+      // Phase 8: tool deadline — if a single round overruns, abort
+      // the ollama stream and let the catch below emit error(...).
+      const deadlineTimer = setTimeout(() => {
+        try {
+          stream.abort();
+        } catch {
+          /* ignore — stream may have finished by the time we fire */
         }
-        const tcs = part.message?.tool_calls;
-        if (tcs) {
-          for (const tc of tcs) {
-            roundToolCalls.push({
-              function: {
-                name: tc.function.name,
-                arguments: (tc.function.arguments ?? {}) as Record<string, unknown>,
-              },
-            });
+      }, config.toolDeadlineMs);
+
+      try {
+          for await (const part of stream) {
+          const delta = part.message?.content;
+          if (delta) {
+            for (const ev of dispatch(splitter.feed(delta))) yield ev;
+          }
+          const tcs = part.message?.tool_calls;
+          if (tcs) {
+            for (const tc of tcs) {
+              roundToolCalls.push({
+                function: {
+                  name: tc.function.name,
+                  arguments: (tc.function.arguments ?? {}) as Record<string, unknown>,
+                },
+              });
+            }
           }
         }
+      } finally {
+        clearTimeout(deadlineTimer);
       }
 
       // Drain any chars the splitter was holding back.
       for (const ev of dispatch(splitter.flush())) yield ev;
+
+      // Phase 8: increment the conversation's token budget usage by
+      // this round's approximate token count (chars/4 rough estimate).
+      // Bumping after each round catches a runaway stream on the next
+      // iteration rather than after the whole turn finishes.
+      const roundTokens = Math.ceil(
+        (splitter.sawReasoning()
+          ? reasoningSteps.reduce((s, r) => s + r.length, 0)
+          : 0) + accumulated.length,
+      ) / 4 | 0;
+      if (roundTokens > 0) {
+        await updateConversationPointers(conversationId, {
+          updated_at: new Date(),
+        });
+        await (await import('../db/index.js')).getPrisma().conversation.update({
+          where: { id: conversationId },
+          data: { tokensUsed: { increment: roundTokens } },
+        });
+      }
 
       await updateNode(asstId, {
         content: accumulated,
