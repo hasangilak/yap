@@ -18,7 +18,8 @@ RUN git clone https://github.com/hasangilak/chrome-cli.git chrome-less \
  && cd chrome-less \
  && git checkout 49e721aec4d687db24add69320780c36a7f8a644 \
  && npm install --silent \
- && npm run build
+ && npm run build \
+ && sed -i 's|"--headless=new",|"--headless=new","--no-sandbox","--disable-setuid-sandbox",|' dist/chrome.js
 
 # ------------------------------------------------------------------
 # Stage 2: yap runtime image
