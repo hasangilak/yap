@@ -21,8 +21,12 @@ RUN apt-get update \
 # the whole thing.
 RUN useradd --create-home --shell /bin/bash --uid 1001 yap
 
-# Enable the pnpm version pinned by packageManager/lockfile.
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+# Pin pnpm 9 explicitly. Corepack was downloading pnpm 10, which adds a
+# strict `onlyBuiltDependencies` allowlist that rejects the chrome-less
+# git dep's prepare script. pnpm 9 accepts the lockfile as-is.
+# typescript is needed globally because chrome-less's prepare step runs
+# `tsc` inside its extracted tarball during `pnpm install`.
+RUN npm install -g pnpm@9.15.0 typescript@5.7.2
 
 USER yap
 WORKDIR /home/yap/app
@@ -35,10 +39,17 @@ ENV NODE_ENV=production \
     MAX_TOOL_ROUNDS=8
 
 # Install dependencies first so the layer caches on source-only edits.
-# `postinstall` runs `prisma generate` to produce the typed client.
+# `--ignore-scripts` skips both the chrome-less git-dep prepare (which
+# fails in a temp folder without yap's @types/node visible) and prisma's
+# postinstall. We run prisma generate and build chrome-less's CLI
+# manually below, where the full dep graph is available.
 COPY --chown=yap:yap package.json pnpm-lock.yaml* ./
 COPY --chown=yap:yap prisma ./prisma
-RUN pnpm install --prod=false
+RUN pnpm install --prod=false --ignore-scripts
+RUN pnpm exec prisma generate
+RUN cd node_modules/chrome-less && \
+    npm install --no-save --silent @types/node @types/ws && \
+    ../../node_modules/.bin/tsc -p tsconfig.json || tsc -p tsconfig.json
 
 COPY --chown=yap:yap tsconfig.json ./
 COPY --chown=yap:yap src ./src
