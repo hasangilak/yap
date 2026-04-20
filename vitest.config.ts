@@ -10,8 +10,7 @@ export default defineConfig({
     setupFiles: ['test/setup.ts'],
     // Run serially so Postgres TRUNCATE doesn't race between files.
     pool: 'threads',
-    poolOptions: {
-      threads: { singleThread: true },
-    },
+    singleThread: true,
+    fileParallelism: false,
   },
 });
