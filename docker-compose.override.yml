@@ -1,0 +1,21 @@
+services:
+  ollama:
+    profiles: ["skip"]
+
+  model-init:
+    profiles: ["skip"]
+
+  yap:
+    environment:
+      OLLAMA_HOST: http://host.docker.internal:11434
+      MODEL: ${MODEL:-qwen2.5:14b}
+      PORT: "3001"
+      MAX_TOOL_ROUNDS: "8"
+      DATABASE_URL: postgres://yap:yap@postgres:5432/yap
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
