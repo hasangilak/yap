@@ -76,8 +76,19 @@ devRouter.post('/seed', async (c) => {
       tool_call: n.toolCall,
       clarify: n.clarify,
       approval: n.approval,
-      streaming: n.streaming === true,
-      status: n.status,
+      // Never seed `streaming: true`, whatever the fixture says.
+      //
+      // In chat-box's sample data the flag is a *display* hint — "draw a
+      // caret on this node". In the database it is a *claim* that a turn is
+      // mid-flight, and the runtime believes it: boot recovery scans for
+      // exactly this and, finding no checkpoint behind it, emits a terminal
+      // `error` and clears the flag. That made every restart after a seed
+      // report a spurious stranded turn on `c-01`.
+      //
+      // Same reasoning for `status`: it drives the "thinking…" indicator, so
+      // a seeded value describes a turn that is not happening.
+      streaming: false,
+      status: undefined,
       edited: n.edited === true,
       created_at: createdAt,
     });
