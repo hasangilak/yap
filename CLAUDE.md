@@ -65,6 +65,8 @@ Key invariants to preserve when editing:
 The turn is a **LangGraph `StateGraph` checkpointed to Postgres**. `src/runtime/run.ts` is only a façade: `runAgent` / `runAssistantTurn` keep their `AsyncGenerator<BusEvent>` signatures and re-yield events the graph pushes onto its `custom` stream channel.
 
 ```
+        ┌── steering ──┐
+        ▼              │
 prepare → callModel → gate → wait → resolvePrompt → execute
               ▲         │                  │           │
               │         └── auto-approved ─┴───────────┤
@@ -75,13 +77,13 @@ prepare → callModel → gate → wait → resolvePrompt → execute
 
 **Rules that dictate this shape — violating any of them breaks pauses silently:**
 
-- **A node containing `interrupt()` re-executes from the top on resume.** So `gate` holds every side effect (persist the row, emit `approval.requested`) and `wait` contains *only* `interrupt()`. Never move side effects into `wait`.
+- **A node containing `interrupt()` re-executes from the top on resume.** So `gate` holds every side effect (persist the row, emit `prompt.requested`) and `wait` contains *only* `interrupt()`. Never move side effects into `wait`.
 - **`interrupt()` propagates by throwing `GraphInterrupt`.** Never wrap `wait` in `try/catch`, or re-throw. The pre-graph loop wrapped a whole round in one `try/catch` that converted throws into `error` events; reintroducing that pattern around a pause turns every approval into a failed turn.
 - **Never call `interrupt()` in a loop over a dynamic list** — LangGraph matches interrupts by index, and the docs describe this as exponential re-execution. Tool calls are gated one per `gate`/`wait` pass with a conditional edge looping back.
 - **`durability: 'sync'`** on every graph call (`turnConfig`). The default `'async'` can lose a checkpoint if the process dies mid-execution — exactly the failure the graph exists to prevent.
 - The façade generator now **ends when the turn pauses**, not only when it completes, because a LangGraph stream terminates at an interrupt. "Generator finished" ≠ "turn finished". The continuation is a separate `resumeTurn()` from whichever endpoint received the answer.
 
-Human input is durable and unified: **every pause is a `Prompt` row**, answered through the single `POST /api/v1/prompts/:id/respond`, which persists the response *then* resumes the graph thread. **`thread_id` is the assistant node id**, so a response finds its paused turn from a database row alone — across requests and across restarts. `src/runtime/recovery.ts` runs before `serve()` and reconciles anything left mid-flight: waiting-on-human is left alone, crashed-between-supersteps is replayed with `null` input, and no-checkpoint gets `streaming` cleared plus a terminal `error`.
+Human input is durable and unified: **every pause is a `Prompt` row**, answered through the single `POST /api/v1/prompts/:id/respond`, which persists the response *then* resumes the graph thread. **`thread_id` is the assistant node id**, so a response finds its paused turn from a database row alone — across requests and across restarts. `src/runtime/recovery.ts` runs before `serve()` and reconciles anything left mid-flight, in this order: **cancelled** is finalized without replaying, waiting-on-human is left alone, crashed-between-supersteps is replayed with `null` input, and no-checkpoint gets `streaming` cleared plus a terminal `error`.
 
 Three invariants in that endpoint, all load-bearing:
 
@@ -95,7 +97,21 @@ The three-layer permission model is unchanged, now in `graph/nodes.ts#isAutoAppr
 
 `graph/checkpointer.ts` owns its own **`langgraph` Postgres schema** (`config.langgraphSchema`) so its four tables never register as drift against Prisma. `test/helpers/db.ts#truncateCheckpoints` clears them; `truncateAll` cannot reach another schema.
 
-`graph/steering.ts` is deliberately **in-memory** — it holds the `AbortController` for the in-flight model call, which cannot outlive the process anyway. Don't "fix" this by persisting it, and never derive that signal from an HTTP request: a client disconnect would kill a turn meant to outlive the request.
+### Interrupting a turn — two verbs, don't conflate them
+
+`POST /conversations/:id/cancel` aborts the model call and **ends** the turn; `POST /conversations/:id/interject` aborts it and **continues** with the user's text folded into the next round. Same abort plumbing, opposite effect on the turn.
+
+`graph/steering.ts` is deliberately **in-memory** — it holds only the `AbortController` for the in-flight model call, which cannot outlive the process anyway. Don't "fix" this by persisting it, and never derive that signal from an HTTP request: a client disconnect would kill a turn meant to outlive the request. Everything *else* about both verbs is durable, and that split is the design:
+
+- **Interjected text is a row** (`interjections`). The endpoint returns 200 once it exists, so the user has been told we accepted it; a `Map` would let a restart discard it silently — the same failure the clarify path used to have. `callModel` **peeks** before the round and **consumes after** it finishes streaming, making delivery at-least-once: a crash mid-round re-injects rather than swallowing user input.
+- **Cancellation is `Node.cancel_requested`.** Durable because boot recovery replays unfinished turns — an in-memory flag would let a restart resurrect a stopped turn. It also makes a late `POST /prompts/:id/respond` return `cancelled: true` instead of resuming.
+
+Two routing rules in `afterCallModel`, both learned from bugs found against a live Ollama:
+
+- **The round budget is checked first**, so it bounds the `callModel` self-edge as well as the tool loop. Without that a user could keep a turn alive forever by interjecting.
+- **`cancelRequested` outranks pending tool calls**; `pendingSteering` sends the loop back to `callModel`. An aborted round is indistinguishable from a finished one by tool calls alone, so without `pendingSteering` a steered turn finalized having accepted the steering and never applied it — and without cancel's precedence, "stop" meant "stop after one more `write_file`".
+
+**A turn parked at an `interrupt()` will never finalize itself**, so `api/cancel.ts` finalizes the node directly in that case. Derive "is a round live?" from the checkpoint (`getPendingInterrupts`), not from the controller map — a stale controller once made `cancel` report `aborted: true` for a parked turn, which skipped that finalize and stranded the node as `streaming` forever. Always clear the controller when a round ends.
 
 The model call lives in `graph/model.ts` via `ChatOllama`. Streaming *and* tool-calling together is load-bearing and fragile upstream (the Python `langchain_ollama` has an open bug where `bindTools` silently collapses streaming into one chunk). `test/integration/runtime.test.ts` mocks `@langchain/ollama` with stringified `tool_call_chunks` to keep that path honest. Aborts are caught, never thrown, so the graph still checkpoints and partial output survives.
 
@@ -130,9 +146,11 @@ The `--no-sandbox` patch is applied by `sed` against the vendored fork's build o
 
 All Prisma access goes through **typed wrappers in `src/db/queries.ts`** — one function per logical op. API handlers and the runtime should not call `getPrisma()` directly except in narrow cases (the runtime has one documented façade for clarify JSON). This convention is what makes the DB integration test in `test/integration/db.test.ts` a meaningful contract.
 
-Schema is 14 models in `prisma/schema.prisma`. The tree model: `Conversation` has many `Node`s forming a DAG (`parent_id`) with a pointer to `activeLeaf`; edits create branches rather than mutating.
+Schema is 15 models in `prisma/schema.prisma`. The tree model: `Conversation` has many `Node`s forming a DAG (`parent_id`) with a pointer to `activeLeaf`; edits create branches rather than mutating.
 
 `Prompt` is one row per human pause, replacing the former `Approval` + `Clarify` pair — same mechanic, discriminated by `kind` with the request/response in JSON. `ApprovalGrant` is deliberately *not* folded in: it is a standing permission keyed by (agent, tool) that outlives the turn, not a per-pause record. Note `Node.approval` is vestigial — nothing in the runtime writes it, and only `dev/seed` fixtures populate it; `Node.clarify` is written only *after* an answer. Neither can tell you a prompt is open, which is what `GET /conversations/:id/prompts?pending=true` is for.
+
+`Interjection` holds mid-turn steering text (see above). `Node.cancel_requested` is the stop flag.
 
 `POST /api/v1/dev/seed` (`src/api/dev.ts` + `src/seed/`) idempotently loads the chat-box `SAMPLE_*` fixtures — agents, conversations, and a branched node tree — to bring a fresh DB to a recognizable state. Safe to re-run; every insert is upsert-no-update.
 

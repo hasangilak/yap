@@ -23,7 +23,7 @@ flowchart LR
 
     subgraph Runtime
         OL[(Ollama :11434<br/>local LLM)]
-        PG[(Postgres :5432<br/>14 Prisma models<br/>+ langgraph schema)]
+        PG[(Postgres :5432<br/>15 Prisma models<br/>+ langgraph schema)]
     end
 
     CB -->|REST + SSE<br/>named events| API
@@ -72,6 +72,7 @@ flowchart TB
         NODES[nodes<br/>edit/branch/regen]
         AGENTS[agents + templates]
         PRM[prompts<br/>respond + pending list]
+        CAN[cancel + interject<br/>stop / steer a turn]
         APPR[approvals<br/>grants only]
         ART[artifacts]
         TAGS[tags + notes]
@@ -99,7 +100,7 @@ flowchart TB
 
     SRV --> LEG
     SRV --> AUTH --> IDEM --> RL --> APIV1
-    APIV1 --> CONV & MSG & STRM & NODES & AGENTS & PRM & APPR & ART & TAGS & SEARCH & EXP
+    APIV1 --> CONV & MSG & STRM & NODES & AGENTS & PRM & CAN & APPR & ART & TAGS & SEARCH & EXP
     MSG --> RUN
     NODES --> RUN
     PRM -->|resumeTurn| RUN
@@ -108,11 +109,11 @@ flowchart TB
     RECOV --> GR
     GR --> TS
     GR --> REG
-    CONV & MSG & STRM & NODES & AGENTS & PRM & APPR & ART & TAGS & SEARCH & EXP --> QRY
+    CONV & MSG & STRM & NODES & AGENTS & PRM & CAN & APPR & ART & TAGS & SEARCH & EXP --> QRY
     GR --> QRY
     QRY --> DB
     STRM --> BUS
-    MSG & NODES & PRM --> BUS
+    MSG & NODES & PRM & CAN --> BUS
     RUN & GR & RECOV --> BUS
     BUS --> ENC
     BUS --> QRY
@@ -129,7 +130,7 @@ flowchart TB
     class SRV entryC
     class LEG,APIV1 surfaceC
     class AUTH,IDEM,RL mwC
-    class CONV,MSG,STRM,NODES,AGENTS,PRM,APPR,ART,TAGS,SEARCH,EXP routerC
+    class CONV,MSG,STRM,NODES,AGENTS,PRM,CAN,APPR,ART,TAGS,SEARCH,EXP routerC
     class RUN,GR,CKPT,RECOV,TS rtC
     class BUS,ENC,TYPES,QRY,DB,SCH,REG dataC
 ```
@@ -239,6 +240,8 @@ flowchart TB
     FINAL --> END([done])
     TC -->|yes, round < MAX| GATE[gate: permission check.<br/>ALL side effects live here —<br/>insert Prompt, emit prompt.requested]
     TC -->|round >= MAX| FINAL
+    CM -->|"cancel_requested<br/>(outranks everything)"| FINAL
+    CM -->|steering pending| CM
     GATE -->|auto approved| EXEC
     GATE -->|needs a human| WAIT[wait: interrupt ONLY.<br/>no side effects, no try/catch]
     WAIT --> CP[(checkpoint to<br/>langgraph schema)]

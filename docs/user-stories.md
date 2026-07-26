@@ -110,7 +110,29 @@ flowchart LR
 - Server path: `api/prompts.ts` + `db/queries.ts#listPrompts`
 - Why it exists: neither `Node.approval` (never written) nor `Node.clarify` (written only *after* the answer) tells a client that a prompt is open, so the alternative was replaying the whole event log.
 
-### 1.9 Edit a past message
+### 1.9 Stop the assistant mid-answer
+
+**As** a chat-box user **I want** a stop button **so that** I can cut off an
+answer that's going the wrong way and just ask again.
+
+- Wire surface: `POST /api/v1/conversations/:id/cancel` (no body) → `turn.cancelled`, then `node.finalized`
+- Server path: `api/cancel.ts` + `Node.cancel_requested` + `graph/nodes.ts#afterCallModel`
+- The turn **ends** and waits for the next message. Partial text already streamed is kept.
+- Cancel outranks a tool call proposed in the same round — stopping never lets one more `write_file` through.
+- Works on a turn parked on an approval too, which is the only way out for a user who doesn't want to decide. A later response to that prompt comes back `cancelled: true`.
+
+### 1.10 Redirect the assistant without stopping it
+
+**As** a chat-box user **I want** to say "actually, do it this way" while the
+assistant is still writing **so that** I don't lose the turn and start over.
+
+- Wire surface: `POST /api/v1/conversations/:id/interject` with `{ text }` → `interjection.received`, then the turn continues into a new round
+- Server path: `api/interject.ts` + the `interjections` table + `graph/nodes.ts#callModel`
+- Distinct from 1.9: same abort, but the turn **keeps running** with the text folded into the next round.
+- `aborted: false` means no live call was cut (turn was paused or between rounds); the text is queued either way.
+- Durable: verified by interjecting, killing the server mid-round, and watching boot recovery apply it.
+
+### 1.11 Edit a past message
 
 **As** a chat-box user **I want** to revise a question I sent three turns ago **so that** I can explore a different direction without losing the original.
 
@@ -121,21 +143,21 @@ flowchart LR
 - Server path: `api/nodes.ts#edit`
 - Why siblings: original is never mutated — the tree model (see `docs/architecture.md` §7) keeps both branches reachable.
 
-### 1.10 Regenerate an assistant reply
+### 1.12 Regenerate an assistant reply
 
 **As** a chat-box user **I want** to get a different assistant answer to the same question **so that** I can compare options.
 
 - Wire surface: `POST /api/v1/nodes/:id/regenerate` → returns the new placeholder asst node synchronously, streams the rest
 - Server path: `api/nodes.ts#regenerate` → `runtime/run.ts#runAssistantTurn`
 
-### 1.11 Branch mid-conversation
+### 1.13 Branch mid-conversation
 
 **As** a chat-box user **I want** to start a fresh turn from an earlier point **so that** I can ask a different follow-up without losing the current thread.
 
 - Wire surface: `POST /api/v1/nodes/:id/branch` → creates an empty user node on `alt-N`, moves `active_leaf` to it, no generation
 - Server path: `api/nodes.ts#branch`
 
-### 1.12 Prune a dead subtree
+### 1.14 Prune a dead subtree
 
 **As** a chat-box user **I want** to delete an abandoned branch **so that** my tree view stays clean.
 
@@ -143,7 +165,7 @@ flowchart LR
 - Server path: `api/nodes.ts` (delete handler)
 - Safety: if `active_leaf` was inside the subtree, `fallback_leaf` is required or the server returns 409.
 
-### 1.13 Pin snippets and take notes
+### 1.15 Pin snippets and take notes
 
 **As** a chat-box user **I want** to pin useful excerpts and attach a note to the whole thread **so that** I can revisit context quickly.
 
@@ -152,7 +174,7 @@ flowchart LR
   - `POST /api/v1/conversations/:id/pinned` / `GET` / `DELETE /pinned/:pid`
 - Server path: `api/notes.ts`
 
-### 1.14 Tag and filter conversations
+### 1.16 Tag and filter conversations
 
 **As** a chat-box user with many conversations **I want** to tag them **so that** I can filter by topic.
 
@@ -161,28 +183,28 @@ flowchart LR
   - `POST /api/v1/conversations/:id/tags` / `DELETE /tags/:tagId`
 - Server path: `api/tags.ts` + `api/conversations.ts`
 
-### 1.15 Search conversations and messages
+### 1.17 Search conversations and messages
 
 **As** a chat-box user **I want** to grep across everything I've said or the assistant has said **so that** I can find a past answer.
 
 - Wire surface: `GET /api/v1/search?q=…` → highlighted matches across conversations, messages, agents
 - Server path: `api/search.ts` — ILIKE-based; not full-text-indexed yet.
 
-### 1.16 See a timeline of significant events
+### 1.18 See a timeline of significant events
 
 **As** a chat-box user **I want** a compact activity feed for a conversation **so that** I can scan what happened without reading every turn.
 
 - Wire surface: `GET /api/v1/conversations/:id/timeline` → synthesised `TimelineEvent[]`
 - Server path: `api/timeline.ts` — projects over the `events` table.
 
-### 1.17 Export a conversation
+### 1.19 Export a conversation
 
 **As** a chat-box user **I want** to download a conversation as markdown or JSON **so that** I can archive or share it offline.
 
 - Wire surface: `GET /api/v1/conversations/:id/export?format=md|json`
 - Server path: `api/export-share.ts`
 
-### 1.18 Share a read-only link
+### 1.20 Share a read-only link
 
 **As** a chat-box user **I want** to generate a URL anyone can read without an account **so that** I can show off a transcript.
 
@@ -192,7 +214,7 @@ flowchart LR
   - `DELETE /api/v1/shares/:token`
 - Server path: `api/export-share.ts` — `/shared/:token` is the one route deliberately exempt from `bearerAuth`.
 
-### 1.19 Open and diff artifacts (canvas)
+### 1.21 Open and diff artifacts (canvas)
 
 **As** a chat-box user **I want** to see what the agent wrote to disk, with diffs between versions **so that** I can review changes before committing.
 
@@ -202,7 +224,7 @@ flowchart LR
   - `GET /api/v1/artifacts/:id/diff?from=…&to=…`
 - Server path: `api/artifacts.ts` — reads from the `ARTIFACTS_DIR` sandbox; every write produces an `ArtifactVersion`.
 
-### 1.20 Swap agents and inspect versions
+### 1.22 Swap agents and inspect versions
 
 **As** a chat-box user curating agents **I want** to edit an agent's prompt, see version history, diff, and roll back **so that** I can iterate without losing a known-good prompt.
 
@@ -212,14 +234,14 @@ flowchart LR
   - `GET /api/v1/agent-templates` / `POST /api/v1/agent-templates/:id/from`
 - Server path: `api/agents.ts` + `api/agent-templates.ts`
 
-### 1.21 Reconnect without losing events
+### 1.23 Reconnect without losing events
 
 **As** a chat-box user on flaky wifi **I want** to reconnect to the stream and catch up on anything I missed **so that** no events are lost.
 
 - Wire surface: `GET /api/v1/conversations/:id/stream?since_event=<last-event-id>` → replays events with id > cursor, then resumes live
 - Server path: `api/stream.ts` (subscribe-first pattern, see `docs/architecture.md` §5)
 
-### 1.22 Replay an accidental duplicate POST
+### 1.24 Replay an accidental duplicate POST
 
 **As** a chat-box developer writing client retry logic **I want** my `Idempotency-Key` header to return the cached response on retry **so that** retries don't double-send messages.
 
@@ -330,8 +352,10 @@ flowchart LR
 | 1.3 | `GET /stream` | `runtime/think-splitter.ts` | `reasoning.delta` |
 | 1.4–1.7 | `POST /prompts/:id/respond` | `api/prompts.ts`, `runtime/graph/nodes.ts` (`gate`/`wait`/`resolvePrompt`) | `prompt.requested`, `prompt.responded` |
 | 1.8 | `GET /conversations/:id/prompts?pending=true` | `api/prompts.ts`, `db/queries.ts#listPrompts` | — |
-| 1.9 | `POST /nodes/:id/edit` | `api/nodes.ts` | `node.created`, `active_leaf.changed`, optional turn events |
-| 1.21 | `GET /stream?since_event=…` | `api/stream.ts` | all persisted events since cursor |
+| 1.9 | `POST /conversations/:id/cancel` | `api/cancel.ts`, `graph/nodes.ts#afterCallModel` | `turn.cancelled`, `node.finalized` |
+| 1.10 | `POST /conversations/:id/interject` | `api/interject.ts`, `graph/nodes.ts#callModel` | `interjection.received` |
+| 1.11 | `POST /nodes/:id/edit` | `api/nodes.ts` | `node.created`, `active_leaf.changed`, optional turn events |
+| 1.23 | `GET /stream?since_event=…` | `api/stream.ts` | all persisted events since cursor |
 | 2.1 | `POST /` | `ollama-agent.ts`, `server.ts` | AG-UI `TEXT_MESSAGE_*`, `RUN_*` |
 | 3.2 | any `/api/v1/*` | `api/middleware/auth.ts` | — |
 | 3.3 | any `/api/v1/*` | `api/middleware/rate-limit.ts` | — |

@@ -33,6 +33,10 @@ a single fetch.**
   minutes later, or after a server restart, and the turn still resumes.
   Users can also **edit a proposed tool call's arguments** before
   approving it.
+- **A running turn can be stopped or steered** —
+  `POST /conversations/:id/cancel` (the stop button: aborts and ends the
+  turn) and `POST /conversations/:id/interject` (aborts and continues
+  with new guidance). See §0.5.8; they are easy to confuse.
 
 ---
 
@@ -300,7 +304,77 @@ fixture, not a real stranded turn.
   visible: `POST /messages` returns once the user node exists, and
   everything after arrives on the stream.
 
-### 0.5.8 Mid-turn steering (additive — nothing breaks)
+### 0.5.8 Interrupting a running turn: two different verbs
+
+Both additive — nothing breaks. But **pick the right one**, because they
+do opposite things to the turn:
+
+| | `POST /:id/cancel` | `POST /:id/interject` |
+|---|---|---|
+| Model call | aborted | aborted |
+| The turn | **ends** | **keeps running** |
+| Next step | waits for the user's next message | runs another round with your text |
+| Body | none | `{ text }` |
+| Use for | the **stop button** | "actually, do it this way instead" |
+
+**`cancel` is the one a chat UI needs first.** It is the stop button: the
+assistant stops, the node finalizes, and nothing else happens until the
+user sends a new message. `interject` is the more unusual verb — it keeps
+one assistant turn alive and redirects it.
+
+```jsonc
+POST /api/v1/conversations/c-1/cancel      // no body
+
+200 { "ok": true, "node_id": "n-d1ad6797",
+      "aborted": true,      // a live model call was cut off
+      "finalized": false }  // the graph will emit node.finalized
+409 { "error": "no turn in flight for this conversation" }
+```
+
+You then receive, in this order:
+
+```
+turn.cancelled        ← always first, so you can label what follows
+content.delta         ← the splitter flush; partial text is kept
+node.finalized
+active_leaf.changed
+```
+
+`turn.cancelled` is a new additive event:
+
+```jsonc
+{ "kind": "turn.cancelled", "node_id": "n-d1ad6797",
+  "aborted": true, "finalized": false }
+```
+
+Render it as **"stopped"**, not "complete" — the assistant text ends
+mid-sentence and that should look deliberate. It always arrives *before*
+`node.finalized`, in both the generating and the parked case, so you can
+label the finalization without knowing which path it took.
+
+Three things worth knowing:
+
+- **Partial output is kept.** Verified live: 14 deltas of essay, stop,
+  and the node keeps `"To write an extensive essay on the history of
+  Amsterdam, I will first conduct"`. Tokens the user already watched
+  arrive are not thrown away.
+- **Cancel outranks a proposed tool call.** If the model asked for
+  `write_file` in the round you cancelled, the tool does **not** run and
+  no approval prompt appears. Stop means stop.
+- **You can cancel a turn parked on an approval**, and you should offer
+  that — otherwise a user who doesn't want to decide has no way out. The
+  response comes back `aborted: false, finalized: true` (there was no
+  live call; the server closed the node itself). If they then click
+  Allow anyway, `POST /prompts/:id/respond` returns
+  `{ resumed: false, cancelled: true }` — the turn stays ended. Treat
+  that as success, not an error.
+- **Cancelling survives a restart.** The flag is persisted, so boot
+  recovery finalizes a cancelled turn rather than resurrecting it.
+
+`cancel` is idempotent while the turn is still live; once it has
+finalized, a second call returns 409.
+
+#### Mid-turn steering (`interject`)
 
 `POST /api/v1/conversations/:id/interject` pushes text into a turn that
 is **already running**, without cancelling it. Think "actually, stop and
@@ -348,8 +422,7 @@ away tokens the user already watched arrive would be worse.
 Three things to design for:
 
 - **The turn does not end.** It keeps streaming, so don't tear down the
-  live UI on a 200. Steering is not cancellation; there is no cancel
-  endpoint.
+  live UI on a 200. If you want it to end, that is `cancel` above.
 - **The text is durable, the abort is not.** The row is written before the
   response, so an interjection survives a restart — tested by killing the
   server mid-round and watching boot recovery replay it and apply it. The
@@ -658,6 +731,16 @@ so concurrent responses cannot both resume the turn.
 `GET /conversations/:id/prompts?pending=true` is the reconnect path: one
 request rebuilds every open prompt. Prefer it to replaying events.
 
+### 3.5b Interrupting a running turn
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/conversations/:id/cancel` | **Stop button** — abort and end the turn. No body |
+| `POST` | `/conversations/:id/interject` | `{ text }` — abort and continue with new guidance |
+
+Both 409 when no turn is in flight. See §0.5.8 — they are easy to confuse
+and do opposite things to the turn.
+
 ### 3.6 Grants
 
 | Method | Path | Purpose |
@@ -899,6 +982,24 @@ interface PromptRespondedEvent extends BaseEvent {
   prompt_id: string;
   tool: string;
   response: PromptResponse;
+}
+
+interface InterjectionReceivedEvent extends BaseEvent {
+  kind: 'interjection.received';
+  node_id: string;
+  interjection_id: string;
+  text: string;
+  /** true = a live model call was cut off; false = queued for the next round. */
+  aborted: boolean;
+}
+
+interface TurnCancelledEvent extends BaseEvent {
+  kind: 'turn.cancelled';
+  node_id: string;
+  /** true = a live model call was cut off. */
+  aborted: boolean;
+  /** true = the cancel endpoint closed the node itself (turn was parked). */
+  finalized: boolean;
 }
 
 interface ArtifactUpdatedEvent extends BaseEvent {
@@ -1431,6 +1532,7 @@ function subscribe(convId: string, lastEventId: string | null, onEvent: Handler)
     'reasoning.delta', 'reasoning.step.end',
     'toolcall.proposed', 'toolcall.started', 'toolcall.ended',
     'prompt.requested', 'prompt.responded',
+    'interjection.received', 'turn.cancelled',
     'artifact.updated',
     'node.finalized', 'active_leaf.changed', 'error',
   ];
@@ -1763,6 +1865,8 @@ Here's how each UI surface maps to a yap endpoint:
 | ApprovalCard | Render `request.approval` + `prompt_id` from `prompt.requested`. On click → `POST /prompts/:id/respond` with `{decision, edited_args?}`. Clear on `prompt.responded`. |
 | Clarify | Same component pattern, same endpoint: `prompt.requested` with `request.prompt_kind: 'clarify'` → `POST /prompts/:id/respond` with `{selected_chip_ids, text}` |
 | Either card, after reload | `GET /conversations/:id/prompts?pending=true` |
+| Stop button | `POST /conversations/:id/cancel` → render `turn.cancelled` as "stopped" |
+| "Change direction" affordance | `POST /conversations/:id/interject` with `{ text }` |
 | ReasoningBlock | Render `MessageNode.reasoning: string[]` |
 | ToolCall | Render `MessageNode.toolCall` |
 | CanvasPane (preview) | `GET /artifacts/:id` |
@@ -1992,7 +2096,7 @@ If you're a developer (or an agent) about to wire chat-box:
 6. Wire the CanvasPane last; it's the most self-contained of the
    panels (single artifact id → three endpoints).
 
-The yap server has 138 tests in `test/` that exercise every one of the
+The yap server has 163 tests in `test/` that exercise every one of the
 wire shapes documented here. If anything in this doc seems wrong
 against what the server actually does, `pnpm test` will catch the
 drift; the schemas in `src/schemas/*.ts` are the ground truth and

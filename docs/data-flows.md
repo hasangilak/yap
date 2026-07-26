@@ -407,7 +407,68 @@ All 16 kinds, checked against the code. Note almost everything now comes from `g
 | `toolcall.ended` | `graph/nodes.ts#execute`, `#resolvePrompt` (on deny) | Result or error |
 | `prompt.requested` | `graph/nodes.ts#gate` | A human is needed: approval or clarify |
 | `prompt.responded` | `graph/nodes.ts#resolvePrompt`; `api/prompts.ts` only when there is nothing to resume | Answer applied |
+| `interjection.received` | `api/interject.ts` | User steered a running turn; `aborted` says whether a live call was cut |
+| `turn.cancelled` | `api/cancel.ts`, `runtime/recovery.ts` | User stopped the turn; always before the finalize |
 | `artifact.updated` | `graph/nodes.ts#execute` | `write_file` produced a new version |
 | `error` | `graph/nodes.ts`, `runtime/recovery.ts` | Budget/deadline/missing-conversation, or an unrecoverable turn found at boot |
+
+### 10b. Interrupting a running turn — cancel vs. interject
+
+Same abort plumbing, opposite effect on the turn. Both persist their intent
+before touching the in-flight call, because the endpoint's 200 is a promise to
+the user that the input landed.
+
+```mermaid
+flowchart TB
+    U([user hits stop / types a redirect]) --> WHICH{which verb?}
+
+    WHICH -->|"POST /:id/cancel"| C1[persist Node.cancel_requested]
+    C1 --> C2{is a round live?<br/>ask the CHECKPOINT,<br/>not the controller map}
+    C2 -->|yes| C3[abort the model call] --> C4[graph wakes, sees the flag]
+    C4 --> C5[finalize — outranks any<br/>tool call just proposed]
+    C2 -->|"no — parked at interrupt()"| C6[endpoint finalizes the node itself:<br/>nothing else ever would]
+    C5 --> DONE([turn ended, waits for<br/>the next user message])
+    C6 --> DONE
+
+    WHICH -->|"POST /:id/interject"| I1[INSERT interjections row]
+    I1 --> I2[abort the model call<br/>best-effort]
+    I2 --> I3[graph wakes: peek finds the row,<br/>pendingSteering = true]
+    I3 --> I4[callModel self-edge:<br/>another round with the text injected]
+    I4 --> I5[consume the row AFTER<br/>the round finishes streaming]
+    I5 --> CONT([turn continues])
+
+    classDef stop fill:#ffcdd2,stroke:#c62828
+    classDef steer fill:#c8e6c9,stroke:#2e7d32
+    classDef decision fill:#e1f5fe,stroke:#0277bd
+    class C1,C3,C5,C6,DONE stop
+    class I1,I2,I3,I4,I5,CONT steer
+    class WHICH,C2 decision
+```
+
+**Why cancellation is durable.** Boot recovery replays unfinished turns, so an
+in-memory flag would let a restart resurrect a turn the user had stopped. It
+also makes a prompt response that arrives *after* the stop return
+`cancelled: true` instead of resuming — the user hitting stop while an approval
+card is on screen, then clicking Allow.
+
+**Why steering is durable, and consumed late.** The row exists before the 200,
+so a restart cannot silently discard what the user typed. `callModel` peeks
+before the round and consumes only after it finishes streaming, making delivery
+at-least-once: a crash mid-round re-injects rather than swallowing the input.
+Re-steering is harmless; losing steering is not.
+
+**Two failure modes this shape was built to fix**, both found against a live
+Ollama rather than in tests:
+
+- An aborted round produces no tool calls, which is indistinguishable from a
+  finished one — so the loop finalized and the steering was never applied
+  (`consumed_at` stayed null). Hence `pendingSteering` and the self-edge.
+- A stale `AbortController` left over from the previous round made `cancel`
+  report `aborted: true` for a *parked* turn, which skipped the branch that
+  finalizes a parked node and stranded it as `streaming` forever. Hence
+  deriving "is a round live?" from the checkpoint, and clearing the controller
+  when a round ends.
+
+---
 
 All BusEvents share the envelope `{ id, at, conversation_id, kind, ... }` (see `src/events/types.ts`), and every one is persisted by `events/bus.ts#publish` **before** being emitted to live subscribers.

@@ -156,7 +156,7 @@ The `/api/v1/*` surface implements every endpoint in
 |---|---|
 | Phase 1 | Conversation CRUD + message tree + SSE stream + `web_search` tool |
 | Phase 2 | Tool approvals + "allow always" grants + three-layer permission model |
-| LangGraph | Turn runtime is a Postgres-checkpointed `StateGraph`; pauses survive restarts. Approvals + clarifications unified into one `Prompt` model with `edited_args` |
+| LangGraph | Turn runtime is a Postgres-checkpointed `StateGraph`; pauses survive restarts. Approvals + clarifications unified into one `Prompt` model with `edited_args`. Adds `POST /:id/cancel` (stop the turn) and `POST /:id/interject` (steer it without stopping) |
 | Phase 3 | Edit (creates branch) / regenerate / branch / prune / ripple-preview |
 | Phase 4 | Agents CRUD + versions + restore + diff + templates + optimizer/eval stubs |
 | Phase 5a | Clarifications via `ask_clarification` pseudo-tool |
@@ -179,6 +179,8 @@ src/
     agents.ts            agents CRUD + versions + restore + diff
     agent-templates.ts   templates catalog, from-template, optimize + eval stubs
     prompts.ts           respond to a prompt, get one, list pending
+    cancel.ts            stop the running turn (the stop button)
+    interject.ts         steer the running turn without stopping it
     approvals.ts         list grants, revoke grant
     artifacts.ts         preview, versions, diff
     tags.ts              CRUD
@@ -203,6 +205,7 @@ src/
       model.ts           ChatOllama streaming round + abort handling
       checkpointer.ts    PostgresSaver on its own `langgraph` schema
       steering.ts        in-memory AbortController per in-flight model call
+                         (the steering *text* is durable — interjections table)
     think-splitter.ts    streaming <think>…</think> parser
 
   db/
@@ -223,13 +226,13 @@ src/
   system-prompt.ts       default assistant prompt
   server.ts              Hono app wiring
 
-prisma/schema.prisma     14 models: Conversation, Node, Agent, AgentVersion,
-                         Event, Prompt, ApprovalGrant, Artifact,
+prisma/schema.prisma     15 models: Conversation, Node, Agent, AgentVersion,
+                         Event, Prompt, Interjection, ApprovalGrant, Artifact,
                          ArtifactVersion, Tag, ConversationTag, ThreadNote,
                          PinnedSnippet, IdempotencyRecord
                          (LangGraph owns 4 more in the `langgraph` schema)
 
-test/                    138 tests across 13 files
+test/                    163 tests across 15 files
   unit/                  schemas, splitter, encoder, tools
                          sandbox, auth, rate-limit
   integration/           db queries, API endpoints, mocked-Ollama runtime,
@@ -266,7 +269,7 @@ pnpm test:unit           # pure-module tests only (no DB needed)
 pnpm test:integration    # DB + API + runtime with mocked Ollama
 ```
 
-138 tests covering:
+163 tests covering:
 
 - Pure modules: `ThinkSplitter`, SSE encoder, rate-limit bucket
   arithmetic, `write_file` sandbox path traversal, schema round-trip
@@ -289,6 +292,11 @@ pnpm test:integration    # DB + API + runtime with mocked Ollama
   splitting, unknown-conversation error.
 - Prompt API: respond/409/400 paths, concurrent responses resolving to
   one winner, and the pending-prompt listing.
+- Interrupt/steer: interjections persisted before the 200 and delivered
+  at-least-once, a steered turn not finalizing before it applies the
+  steering, the steering self-loop staying inside the round budget, a
+  cancel outranking a proposed tool call, and cancelling a turn parked on
+  a prompt actually finalizing it.
 - Middleware: auth + idempotency + rate-limit end-to-end.
 
 ## Containerization
