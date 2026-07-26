@@ -1,9 +1,29 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { config } from '../config.js';
 
 const require = createRequire(import.meta.url);
 const CHROME_LESS_CLI =
-  process.env.CHROME_LESS_BIN ?? require.resolve('chrome-less/dist/cli.js');
+  config.chromeLessBin || require.resolve('chrome-less/dist/cli.js');
+
+/**
+ * The env handed to the browser subprocess.
+ *
+ * This is an allowlist, not `{...process.env}`: the child drives a real
+ * Chromium over untrusted third-party pages, and the renderer sandbox may
+ * be disabled in container builds (see CHROME_NO_SANDBOX in the
+ * Dockerfile). Passing yap's own environment would hand DATABASE_URL and
+ * YAP_API_TOKEN to a compromised renderer. Only process-level plumbing
+ * gets through — HOME because chrome-less keeps its Chrome profile under
+ * `~/.chrome-less`, and CHROME_LESS_CHROME to pick the browser binary.
+ */
+function childEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '' };
+  if (process.env.HOME) env.HOME = process.env.HOME;
+  if (process.env.TMPDIR) env.TMPDIR = process.env.TMPDIR;
+  if (config.chromeLessChrome) env.CHROME_LESS_CHROME = config.chromeLessChrome;
+  return env;
+}
 
 interface RunResult {
   stdout: string;
@@ -14,7 +34,7 @@ interface RunResult {
 function run(args: string[]): Promise<RunResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     const proc = spawn('node', [CHROME_LESS_CLI, ...args], {
-      env: { ...process.env },
+      env: childEnv(),
     });
     let stdout = '';
     let stderr = '';

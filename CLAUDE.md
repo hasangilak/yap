@@ -23,6 +23,16 @@ Integration tests expect `DATABASE_URL=postgres://yap:yap@localhost:5432/yap` (t
 
 Before running integration tests locally: `docker compose up -d postgres` and `pnpm db:push`.
 
+```bash
+docker compose up -d postgres            # just the DB — what local dev needs
+docker compose up                        # postgres + db-init + yap, pointed at a HOST Ollama
+docker compose -f docker-compose.yml up  # self-contained: adds containerized ollama + model pull
+```
+
+`docker-compose.override.yml` is committed, so **it applies by default and changes which services exist**: it assigns `ollama` and `model-init` to a `skip` profile (excluding them) and points `yap` at `host.docker.internal:11434`. So a bare `docker compose up` starts only postgres/db-init/yap and *requires* Ollama already running on the host — it does not pull a model. Naming the base file explicitly (`-f docker-compose.yml`) drops the override and gives you the self-contained stack with a containerized Ollama on `ollama:11434`. Verify with `docker compose config --services` before debugging a "missing" container. `db-init` runs `pnpm db:push` on every `up` (no migrations yet).
+
+The Dockerfile pre-builds `chrome-less` in a builder stage — a plain `pnpm install` inside the image will not produce a working browser tool. See the browser-tool section for the `--no-sandbox` build arg.
+
 ## Architecture
 
 One Node process, one Hono app, **two HTTP personalities** on the same port:
@@ -65,13 +75,34 @@ Because these coordinators hold promises **in-process**, the server is single-in
 
 ### Tools
 
-`src/registry/tools.ts` is the single source of truth for tool definitions AND the `executeTool` dispatcher. The shapes mirror chat-box's `SAMPLE_TOOLS` exactly (id/name/desc/enabled/auto) — keep them in sync. `write_file` is sandboxed to `config.artifactsDir`; the path-traversal check lives in the executor and has unit tests in `test/unit/tools.test.ts` — preserve it.
+`src/registry/tools.ts` holds **three lists that must be reconciled by hand** — this is the most common source of confusion:
+
+1. `TOOL_DEFS` — 7 entries, the *display* catalog served to chat-box. Shapes mirror chat-box's `SAMPLE_TOOLS` exactly (id/name/desc/enabled/auto); `enabled: false` renders but isn't selectable.
+2. `OLLAMA_TOOLS` — 3 function-calling schemas actually injected into `chat()`: `web_search`, `write_file`, `ask_clarification`. A tool absent here is invisible to the model no matter what `TOOL_DEFS` says.
+3. `executeTool` — implements only `web_search` and `write_file`; everything else returns `tool '<name>' is not implemented yet` so the model can recover rather than hang. `ask_clarification` never reaches here — it's a pseudo-tool intercepted by `runtime/run.ts`.
+
+`isSideEffectful()` (`write_file`, `run_tests`, `send_email`) is what routes a call into the approval round-trip. `write_file` is sandboxed to `config.artifactsDir` with a two-layer check (reject `..`/absolute/`~` in the raw arg, then re-verify the *resolved* path is still under the sandbox); unit tests in `test/unit/tools.test.ts` cover it — preserve both layers.
+
+### Browser tool (`src/tools/browser.ts`)
+
+`web_search` is not an HTTP client. Each call `spawn`s `node <chrome-less>/dist/cli.js` as a **subprocess** (resolved via `require.resolve`, overridable with `config.chromeLessBin`), which drives a real Chromium over CDP and prints the page as a numbered accessibility tree. The exported verbs (`webSearch`/`webGoto`/`webClick`/`webType`/`webBack`) all end by running `text` and returning the current page, so the model sees element ids it can click or type into. Searches go through `lite.duckduckgo.com/lite/`.
+
+Consequences: the tool needs a working Chromium on the host, is slow relative to everything else (hence `TOOL_DEADLINE_MS`), and non-zero exit codes throw with stderr folded into the message. Only `web_search` is currently wired into `executeTool` — the other verbs are implemented but unexposed.
+
+**This subprocess renders untrusted third-party pages, so treat it as the least-trusted thing in the process tree.** Two consequences to preserve:
+
+- `browser.ts` hands the child an **allowlisted env** (`PATH`, `HOME`, `TMPDIR`, `CHROME_LESS_CHROME`) rather than `{...process.env}`. Don't widen this back out — the full env carries `DATABASE_URL` and `YAP_API_TOKEN`, which a compromised renderer would otherwise inherit.
+- Chromium's own sandbox needs an unprivileged user namespace, which some Docker seccomp profiles deny; the Dockerfile's `CHROME_NO_SANDBOX` build arg (default `1`) injects `--no-sandbox` into chrome-less's hardcoded `CHROME_FLAGS`. Build with `--build-arg CHROME_NO_SANDBOX=0` on a host that permits userns to keep the renderer sandbox.
+
+The `--no-sandbox` patch is applied by `sed` against the vendored fork's build output, so it only exists **inside the image** — a host `pnpm install` gets an unpatched chrome-less, and sandbox-related behavior can differ between the two. The real fix is upstream in `hasangilak/chrome-cli` (a `CHROME_FLAGS` env hook); until then the `sed` is followed by a `grep -q` guard so a pin bump that moves the pattern fails the build instead of silently shipping a broken browser.
 
 ### Database layer
 
 All Prisma access goes through **typed wrappers in `src/db/queries.ts`** — one function per logical op. API handlers and the runtime should not call `getPrisma()` directly except in narrow cases (the runtime has one documented façade for clarify JSON). This convention is what makes the DB integration test in `test/integration/db.test.ts` a meaningful contract.
 
 Schema is 15 models in `prisma/schema.prisma`. The tree model: `Conversation` has many `Node`s forming a DAG (`parent_id`) with a pointer to `activeLeaf`; edits create branches rather than mutating.
+
+`POST /api/v1/dev/seed` (`src/api/dev.ts` + `src/seed/`) idempotently loads the chat-box `SAMPLE_*` fixtures — agents, conversations, and a branched node tree — to bring a fresh DB to a recognizable state. Safe to re-run; every insert is upsert-no-update.
 
 ### Schemas (`src/schemas/`)
 
@@ -83,10 +114,22 @@ Zod schemas mirror `chat-box/src/types.ts` wire types. The `BusEvent` union in `
 - Prisma runs on `postinstall`, so `@prisma/client` types are always generated after `pnpm install`.
 - Commit message style: short imperative headline with a category prefix (`Testing:`, `API:`, `Runtime:`, `Docs:`, etc.) — follow `git log` for examples. Do not mention Claude/Claude Code in commit messages.
 - `src/ollama-agent.ts` is explicitly labeled "legacy" — it powers the AG-UI `POST /` surface and is stable. Feature work belongs in `src/api/` + `src/runtime/`, not here.
+- **`Phase N` / `PHASE-N:` comments are stale scaffolding, not a roadmap.** Several say things like "Phase 2 will gate these behind an approval round-trip" when approvals already ship (the `awaitDecision` call in `runtime/run.ts`). Trust the code and this file over those markers; delete them when you touch the surrounding lines.
+- All tunables funnel through `src/config.ts` (env with defaults) — read config there rather than `process.env` at use sites, and document each one in `.env.example`. The only sanctioned exceptions are process-level plumbing that isn't a product knob (`PATH`/`HOME`/`TMPDIR` when building the browser subprocess env) and `test/setup.ts`.
+  
+
+## Git
+
+Commit gradually: one small, logical commit per coherent unit of work, conventional-commit prefix (`docs:`, `feat:`, `fix:`, `chore:`). Commit messages must not mention Claude, Claude Code, or any AI authorship — no `Co-Authored-By` trailer.
 
 ## Documentation
 
 - `README.md` — quick start, smoke tests, env vars, phase inventory.
 - `INTEGRATION.md` — authoritative guide for AG-UI (`ai-remark`) clients hitting `POST /`.
 - `docs/chat-box-integration.md` — authoritative API/SSE/types guide for the chat-box frontend consuming `/api/v1/*`. Update this when changing any wire contract.
+- `docs/architecture.md` — Mermaid diagrams of system context, module layout, and the two HTTP surfaces. Start here for structure.
+- `docs/data-flows.md` — sequence diagrams for the load-bearing flows (message → stream, approval round-trip, replay).
+- `docs/user-stories.md` — the three caller personas (chat-box user, ai-remark user, operator) mapped to endpoints and code paths. Start here for *why* a surface exists.
 - `docs/server-upgrade-plan.md` — historical phased design doc; the shipped surface now matches what's listed here. Treat as reference, not a todo list.
+
+Note: `package.json` still names the project `simplest-llm` from its AG-UI-bridge origin. The product is `yap`.

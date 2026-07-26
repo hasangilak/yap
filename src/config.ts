@@ -20,4 +20,14 @@ export const config = {
   toolDeadlineMs: Number(process.env.TOOL_DEADLINE_MS ?? 30_000),
   /// Sliding-window rate limit in requests per minute per IP/token.
   rateLimitRpm: Number(process.env.RATE_LIMIT_RPM ?? 60),
+  /// Override for the chrome-less CLI entrypoint. Empty = resolve the
+  /// installed `chrome-less` package.
+  chromeLessBin: process.env.CHROME_LESS_BIN ?? '',
+  /// Chrome/Chromium binary chrome-less should drive. Read by the child
+  /// process, not by yap — forwarded explicitly in tools/browser.ts.
+  chromeLessChrome: process.env.CHROME_LESS_CHROME ?? '',
+  /// Postgres schema LangGraph's checkpointer owns. Kept out of `public`
+  /// so its four tables never collide with Prisma's models or show up as
+  /// drift in `prisma db push`.
+  langgraphSchema: process.env.LANGGRAPH_SCHEMA ?? 'langgraph',
 };
