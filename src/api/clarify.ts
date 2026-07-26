@@ -1,19 +1,29 @@
 import { Hono } from 'hono';
-import { getClarify } from '../db/queries.js';
+import { getClarify, recordClarifyResponse } from '../db/queries.js';
 import { publish } from '../events/bus.js';
 import { newEventId } from '../events/types.js';
-import { resolveClarify } from '../runtime/clarifications.js';
+import { getPendingInterrupts } from '../runtime/graph/index.js';
+import { resumeTurn } from '../runtime/run.js';
 import { ClarifyAnswerRequestSchema } from '../schemas/index.js';
+import { detachAndPublish } from './drain.js';
 
 export const clarifyRouter = new Hono();
 
 /**
  * POST /api/v1/clarify/:id/answer
  *
- * Records the structured answer and wakes the paused runtime so the
- * turn can continue. Publishes a clarify.answered event either way —
- * even if the runtime isn't alive to observe, the stream + timeline
- * pick up the decision.
+ * Records the structured answer, then resumes the paused turn.
+ *
+ * Note the ordering: the answer is written to the `Clarify` row **before** the
+ * graph is resumed. Previously this handler persisted nothing — it published
+ * the event and woke an in-process promise, leaving `recordClarifyResponse` to
+ * the runtime after `awaitAnswer` resolved. If no runtime was listening the
+ * answer was silently lost, and the approval path (which did persist first)
+ * disagreed with this one. Both now persist first.
+ *
+ * `clarify.answered` is emitted by the graph's `resolvePrompt` node so it stays
+ * ordered with the rest of the turn; it is published here only when there is
+ * nothing to resume.
  */
 clarifyRouter.post('/:id/answer', async (c) => {
   const id = c.req.param('id');
@@ -25,20 +35,30 @@ clarifyRouter.post('/:id/answer', async (c) => {
     return c.json({ error: 'already answered' }, 409);
   }
 
-  // Publish the event first so it lands on the wire for any open
-  // stream; the runtime's own emission (if alive) is redundant but
-  // that's OK — events are idempotent-keyed by id.
-  await publish({
-    kind: 'clarify.answered',
-    id: newEventId(),
-    at: Date.now(),
-    conversation_id: row.conversationId,
-    node_id: row.nodeId,
-    clarify_id: id,
-    response: body,
-  });
+  await recordClarifyResponse(id, body);
 
-  const awake = resolveClarify(id, body);
+  const pending = await getPendingInterrupts(row.nodeId);
+  if (pending.length === 0) {
+    await publish({
+      kind: 'clarify.answered',
+      id: newEventId(),
+      at: Date.now(),
+      conversation_id: row.conversationId,
+      node_id: row.nodeId,
+      clarify_id: id,
+      response: body,
+    });
+    return c.json({ ok: true, resumed: false });
+  }
 
-  return c.json({ ok: true, runtime_awake: awake });
+  detachAndPublish(
+    resumeTurn({
+      conversationId: row.conversationId,
+      asstNodeId: row.nodeId,
+      resume: body,
+    }),
+    'clarify-resume',
+  );
+
+  return c.json({ ok: true, resumed: true });
 });

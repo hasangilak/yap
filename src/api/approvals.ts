@@ -8,21 +8,32 @@ import {
 } from '../db/queries.js';
 import { publish } from '../events/bus.js';
 import { newEventId } from '../events/types.js';
-import { resolveApproval } from '../runtime/approvals.js';
+import { getPendingInterrupts } from '../runtime/graph/index.js';
+import { resumeTurn } from '../runtime/run.js';
 import { ApprovalDecisionRequestSchema } from '../schemas/index.js';
+import { detachAndPublish } from './drain.js';
 
 export const approvalsRouter = new Hono();
 
 /**
  * POST /api/v1/approvals/:id/decide
  *
- * Records the user's decision and, if there's still a runtime waiting
- * for it in this process, wakes that runtime so the turn can continue.
- * An `approval.decided` event is always published — whether or not the
- * runtime was live — so the stream + the timeline see the decision.
+ * Records the decision, then resumes the paused turn.
  *
- * 'always' adds the grant here defensively; the runtime also writes
- * the grant on its path. Double-write is a no-op thanks to upsert.
+ * The decision is persisted **before** the graph is resumed, so an answer is
+ * never lost to a failure in between. Resuming is a checkpointer operation
+ * rather than a promise handoff, which is what makes this work long after the
+ * original request returned, from any request, and across a restart — the case
+ * that used to strand a turn permanently.
+ *
+ * `approval.decided` is emitted by the graph's `resolvePrompt` node so it stays
+ * ordered with the rest of the turn. If there is nothing to resume (no pending
+ * interrupt for this thread — e.g. a turn whose checkpoint predates this
+ * feature), the event is published here instead so the timeline still records
+ * the decision.
+ *
+ * 'always' writes the grant here as well as in the graph; the upsert makes the
+ * double-write a no-op.
  */
 approvalsRouter.post('/:id/decide', async (c) => {
   const id = c.req.param('id');
@@ -34,41 +45,44 @@ approvalsRouter.post('/:id/decide', async (c) => {
     return c.json({ error: 'already decided', decision: ap.decision }, 409);
   }
 
-  // Look up the agentId through the conversation so we can key a grant
-  // if the decision is 'always'.
   const rememberKey = body.decision === 'always'
     ? `tool:${ap.tool}:conversation:${ap.conversationId}`
     : null;
 
   await recordApprovalDecision(id, body.decision, rememberKey);
 
-  // Publish the decided event before resolving so any SSE subscriber
-  // sees it; the runtime will emit its own approval.decided too, but
-  // that path only runs if the runtime was waiting. This one guarantees
-  // the timeline captures the decision even if the runtime died.
-  await publish({
-    kind: 'approval.decided',
-    id: newEventId(),
-    at: Date.now(),
-    conversation_id: ap.conversationId,
-    node_id: ap.nodeId,
-    approval_id: id,
-    decision: body.decision,
-  });
-
-  // Grant on 'always' — belt-and-braces; runtime will also write this.
   if (body.decision === 'always') {
-    // We don't have agent_id directly on the approval row; derive via
-    // conversation. (A later pass can denormalize agentId onto
-    // approvals if this lookup becomes a hot path.)
     const { getConversationRaw } = await import('../db/queries.js');
     const conv = await getConversationRaw(ap.conversationId);
     if (conv) await insertGrant(conv.agentId, ap.tool);
   }
 
-  const wokeRuntime = resolveApproval(id, body.decision);
+  // The assistant node id is the graph thread id, so the paused turn is one
+  // lookup away from the row we already have.
+  const pending = await getPendingInterrupts(ap.nodeId);
+  if (pending.length === 0) {
+    await publish({
+      kind: 'approval.decided',
+      id: newEventId(),
+      at: Date.now(),
+      conversation_id: ap.conversationId,
+      node_id: ap.nodeId,
+      approval_id: id,
+      decision: body.decision,
+    });
+    return c.json({ ok: true, decision: body.decision, resumed: false });
+  }
 
-  return c.json({ ok: true, decision: body.decision, runtime_awake: wokeRuntime });
+  detachAndPublish(
+    resumeTurn({
+      conversationId: ap.conversationId,
+      asstNodeId: ap.nodeId,
+      resume: body.decision,
+    }),
+    'approval-resume',
+  );
+
+  return c.json({ ok: true, decision: body.decision, resumed: true });
 });
 
 /**

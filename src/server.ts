@@ -10,6 +10,8 @@ import { apiV1 } from './api/index.js';
 import { bearerAuth } from './api/middleware/auth.js';
 import { idempotency } from './api/middleware/idempotency.js';
 import { rateLimit } from './api/middleware/rate-limit.js';
+import { closeCheckpointer } from './runtime/graph/checkpointer.js';
+import { recoverInterruptedTurns } from './runtime/recovery.js';
 
 const app = new Hono();
 const encoder = new EventEncoder();
@@ -43,6 +45,12 @@ app.use('/api/v1/*', rateLimit);
 app.use('/api/v1/*', idempotency);
 app.route('/api/v1', apiV1);
 
+// Reconcile turns that were mid-flight when this process last stopped, before
+// accepting any connections. Turns paused on human input are left alone (their
+// checkpoint is durable and a decision will resume them); crashed ones are
+// replayed; unrecoverable ones stop pretending to be live.
+await recoverInterruptedTurns();
+
 serve({ fetch: app.fetch, port: config.port }, (info) => {
   console.log(`yap listening on http://localhost:${info.port}`);
   console.log(`  POST /                          AG-UI stream (ai-remark)`);
@@ -51,3 +59,23 @@ serve({ fetch: app.fetch, port: config.port }, (info) => {
   console.log(`  POST /api/v1/dev/seed           load SAMPLE_* fixtures`);
   console.log(`Model: ${config.defaultModel}   Ollama: ${config.ollamaHost}`);
 });
+
+/**
+ * Release the checkpointer's connection pool on shutdown.
+ *
+ * Turns paused on human input need no special handling here — that is the
+ * point of checkpointing them. They are already durable in Postgres and will
+ * be picked up by `recoverInterruptedTurns()` on the next boot, so a restart
+ * mid-approval is now survivable rather than fatal to the turn.
+ */
+let shuttingDown = false;
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[${signal}] shutting down`);
+    void closeCheckpointer()
+      .catch((err) => console.error('[shutdown]', err))
+      .finally(() => process.exit(0));
+  });
+}
