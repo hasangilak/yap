@@ -1,36 +1,66 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Hoisted fixture the vi.mock factory reads. Each test pushes a script
-// (array of chunks) per anticipated ollama.chat() call; the mock
-// shifts one script per call.
-const { CHAT_SCRIPTS, CHAT_OPTS } = vi.hoisted(() => ({
-  CHAT_SCRIPTS: [] as Array<Array<{ content?: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }>>,
-  CHAT_OPTS: [] as Array<Record<string, unknown>>,
+/**
+ * Hoisted fixtures the `vi.mock` factory reads. Each test pushes one script
+ * (an array of chunks) per anticipated model round; the mock shifts one script
+ * per `.stream()` call.
+ *
+ * The mock targets `@langchain/ollama` rather than `ollama` because the turn
+ * runtime now goes through `ChatOllama`. It yields real `AIMessageChunk`
+ * instances with `tool_call_chunks` carrying **stringified** args, which is
+ * what a live Ollama stream actually produces — the runtime relies on
+ * `AIMessageChunk.concat()` to reassemble and parse them, so faking the parsed
+ * shape would test a code path that never runs in production.
+ */
+const { CHAT_SCRIPTS, STREAM_CALLS } = vi.hoisted(() => ({
+  CHAT_SCRIPTS: [] as Array<
+    Array<{
+      content?: string;
+      tool_calls?: Array<{
+        function: { name: string; arguments: Record<string, unknown> };
+      }>;
+    }>
+  >,
+  STREAM_CALLS: [] as Array<Record<string, unknown>>,
 }));
 
-vi.mock('ollama', () => {
-  class Ollama {
-    async chat(opts: Record<string, unknown>) {
-      CHAT_OPTS.push(opts);
-      const script = CHAT_SCRIPTS.shift() ?? [];
-      async function* gen() {
-        for (const chunk of script) {
-          yield {
-            message: {
-              content: chunk.content ?? '',
-              tool_calls: chunk.tool_calls,
-            },
-          };
-        }
-      }
-      const iter = gen();
-      // chrome-less/ollama abortable iterator requires .abort(); keep
-      // it a no-op.
-      (iter as unknown as { abort: () => void }).abort = () => {};
-      return iter;
+vi.mock('@langchain/ollama', async () => {
+  const { AIMessageChunk } = await import('@langchain/core/messages');
+  class ChatOllama {
+    constructor(public opts: Record<string, unknown>) {}
+
+    bindTools() {
+      return {
+        stream: async (
+          messages: unknown,
+          callOpts?: Record<string, unknown>,
+        ) => {
+          STREAM_CALLS.push({ messages, callOpts });
+          const script = CHAT_SCRIPTS.shift() ?? [];
+          async function* gen() {
+            for (const chunk of script) {
+              if (chunk.tool_calls) {
+                yield new AIMessageChunk({
+                  content: chunk.content ?? '',
+                  tool_call_chunks: chunk.tool_calls.map((tc, i) => ({
+                    name: tc.function.name,
+                    args: JSON.stringify(tc.function.arguments),
+                    id: `call_${i}`,
+                    index: i,
+                    type: 'tool_call_chunk' as const,
+                  })),
+                });
+              } else {
+                yield new AIMessageChunk({ content: chunk.content ?? '' });
+              }
+            }
+          }
+          return gen();
+        },
+      };
     }
   }
-  return { Ollama };
+  return { ChatOllama };
 });
 
 // Also mock the browser so tool tests don't try to fire up Chrome.
@@ -42,7 +72,9 @@ vi.mock('../../src/tools/browser.js', () => ({
   webBack: vi.fn(async () => 'stub back'),
 }));
 
-import { runAgent } from '../../src/runtime/run.js';
+import { resumeTurn, runAgent } from '../../src/runtime/run.js';
+import { setupCheckpointer } from '../../src/runtime/graph/checkpointer.js';
+import { getPendingInterrupts } from '../../src/runtime/graph/index.js';
 import {
   firstAgentId,
   getConversationRaw,
@@ -50,25 +82,19 @@ import {
   insertConversation,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
-import { resolveApproval } from '../../src/runtime/approvals.js';
-import { disconnectDb, truncateAll } from '../helpers/db.js';
+import {
+  disconnectDb,
+  truncateAll,
+  truncateCheckpoints,
+} from '../helpers/db.js';
 import type { BusEvent } from '../../src/schemas/index.js';
 
-async function drain(gen: AsyncGenerator<BusEvent, void, unknown>): Promise<BusEvent[]> {
+async function drain(
+  gen: AsyncGenerator<BusEvent, void, unknown>,
+): Promise<BusEvent[]> {
   const out: BusEvent[] = [];
   for await (const ev of gen) out.push(ev);
   return out;
-}
-
-/** Poll `check` at 10ms until it returns non-null or deadline elapses. */
-async function waitFor<T>(check: () => T | null, timeoutMs: number): Promise<T> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const v = check();
-    if (v != null) return v;
-    await new Promise((r) => setTimeout(r, 10));
-  }
-  throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
 async function seed() {
@@ -84,8 +110,10 @@ async function seed() {
 
 beforeEach(async () => {
   CHAT_SCRIPTS.length = 0;
-  CHAT_OPTS.length = 0;
+  STREAM_CALLS.length = 0;
+  await setupCheckpointer();
   await truncateAll();
+  await truncateCheckpoints();
   await seed();
 });
 
@@ -100,12 +128,9 @@ describe('runtime — happy path (text only)', () => {
       runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }),
     );
     const kinds = events.map((e) => e.kind);
-    // First three are stable:
     expect(kinds[0]).toBe('node.created');
     expect(kinds[1]).toBe('active_leaf.changed');
     expect(kinds[2]).toBe('node.created');
-    // Contains at least one content.delta and ends with the two
-    // finalization events.
     expect(kinds).toContain('content.delta');
     expect(kinds[kinds.length - 2]).toBe('node.finalized');
     expect(kinds[kinds.length - 1]).toBe('active_leaf.changed');
@@ -122,11 +147,20 @@ describe('runtime — happy path (text only)', () => {
     expect(nodes).toHaveLength(1);
     expect(nodes[0]!.content).toContain('some output text');
   });
+
+  it('clears streaming so boot recovery does not treat the turn as stranded', async () => {
+    CHAT_SCRIPTS.push([{ content: 'done' }]);
+    await drain(runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }));
+    const nodes = await getPrisma().node.findMany({
+      where: { conversationId: 'c-r', role: 'asst' },
+    });
+    expect(nodes[0]!.streaming).toBe(false);
+    expect(nodes[0]!.status).toBeNull();
+  });
 });
 
 describe('runtime — tool call flow', () => {
   it('auto-approved web_search produces toolcall.proposed/started/ended then a second assistant round', async () => {
-    // Round 1: model requests web_search
     CHAT_SCRIPTS.push([
       {
         tool_calls: [
@@ -134,7 +168,6 @@ describe('runtime — tool call flow', () => {
         ],
       },
     ]);
-    // Round 2: model produces a concluding message
     CHAT_SCRIPTS.push([{ content: 'Based on results: …' }]);
 
     const events = await drain(
@@ -150,8 +183,7 @@ describe('runtime — tool call flow', () => {
     expect(kinds).not.toContain('approval.requested');
   });
 
-  it('write_file requires approval; deny → toolcall.ended(err) and runtime continues', async () => {
-    // Round 1: model calls write_file (side-effectful → approval)
+  it('write_file pauses the turn on an interrupt rather than blocking in-process', async () => {
     CHAT_SCRIPTS.push([
       {
         tool_calls: [
@@ -164,35 +196,91 @@ describe('runtime — tool call flow', () => {
         ],
       },
     ]);
-    // Round 2: continuation after user denies
+
+    // The generator now *completes* at the pause — a LangGraph stream
+    // terminates when a node interrupts. Previously this required draining in
+    // the background because the runtime blocked on an in-process promise.
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const approvalEv = first.find((e) => e.kind === 'approval.requested');
+    expect(approvalEv).toBeDefined();
+
+    // The pause is durable: it lives in the checkpointer, not in memory.
+    const asstId = (approvalEv as { node_id: string }).node_id;
+    expect(await getPendingInterrupts(asstId)).toHaveLength(1);
+
+    // Only one model round happened; the turn is genuinely parked.
+    expect(STREAM_CALLS).toHaveLength(1);
+  });
+
+  it('deny → toolcall.ended(err) and the turn continues after resume', async () => {
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'x.txt', content: 'y' },
+            },
+          },
+        ],
+      },
+    ]);
     CHAT_SCRIPTS.push([{ content: 'OK, I will not write.' }]);
 
-    const seen: BusEvent[] = [];
-    const gen = runAgent({ conversationId: 'c-r', parent: null, content: 'do it' });
-
-    // Drain the generator in the background so awaitDecision actually
-    // gets a chance to register before we fire resolveApproval.
-    const drainPromise = (async () => {
-      for await (const ev of gen) seen.push(ev);
-    })();
-
-    // Wait for the runtime to reach its blocking awaitDecision().
-    const approvalEv = await waitFor(
-      () => seen.find((e) => e.kind === 'approval.requested') ?? null,
-      3_000,
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
     );
-    expect(approvalEv).toBeDefined();
-    resolveApproval(
-      (approvalEv as { approval_id: string }).approval_id,
-      'deny',
-    );
-    await drainPromise;
+    const approvalEv = first.find((e) => e.kind === 'approval.requested');
+    const asstId = (approvalEv as { node_id: string }).node_id;
 
-    const kinds = seen.map((e) => e.kind);
+    const second = await drain(
+      resumeTurn({ conversationId: 'c-r', asstNodeId: asstId, resume: 'deny' }),
+    );
+
+    const kinds = second.map((e) => e.kind);
     expect(kinds).toContain('approval.decided');
-    const ended = seen.find((e) => e.kind === 'toolcall.ended');
-    expect((ended as { status: string; error?: string }).status).toBe('err');
+    const ended = second.find((e) => e.kind === 'toolcall.ended');
+    expect((ended as { status: string }).status).toBe('err');
     expect((ended as { error?: string }).error).toMatch(/denied/i);
+    // The loop resumed: a second model round ran and the turn finalized.
+    expect(STREAM_CALLS).toHaveLength(2);
+    expect(kinds).toContain('node.finalized');
+  });
+
+  it('allow → the tool runs and the turn finalizes', async () => {
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'allowed.txt', content: 'hi' },
+            },
+          },
+        ],
+      },
+    ]);
+    CHAT_SCRIPTS.push([{ content: 'Written.' }]);
+
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const asstId = (
+      first.find((e) => e.kind === 'approval.requested') as { node_id: string }
+    ).node_id;
+
+    const second = await drain(
+      resumeTurn({ conversationId: 'c-r', asstNodeId: asstId, resume: 'allow' }),
+    );
+    const kinds = second.map((e) => e.kind);
+    expect(kinds).toContain('toolcall.started');
+    const ended = second.find((e) => e.kind === 'toolcall.ended');
+    expect((ended as { status: string }).status).toBe('ok');
+    expect(kinds).toContain('node.finalized');
+    // Nothing is left pending once the turn is done.
+    expect(await getPendingInterrupts(asstId)).toHaveLength(0);
   });
 });
 
@@ -205,16 +293,15 @@ describe('runtime — token budget', () => {
     const events = await drain(
       runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }),
     );
-    // runAgent creates the user node + active_leaf.changed before
-    // delegating to runAssistantTurn, so the error comes after those
-    // two. The point is: no ollama.chat() call was ever issued.
+    // runAgent creates the user node + active_leaf.changed before delegating,
+    // so the error follows those two. The point: no model call was issued.
     const kinds = events.map((e) => e.kind);
     expect(kinds[0]).toBe('node.created');
     expect(kinds[1]).toBe('active_leaf.changed');
     const err = events.find((e) => e.kind === 'error');
     expect(err).toBeDefined();
     expect((err as { recoverable: boolean }).recoverable).toBe(false);
-    expect(CHAT_OPTS).toHaveLength(0);
+    expect(STREAM_CALLS).toHaveLength(0);
   });
 });
 
@@ -242,9 +329,11 @@ describe('runtime — <think> tag splitting', () => {
     const kinds = events.map((e) => e.kind);
     expect(kinds).toContain('reasoning.delta');
     expect(kinds).toContain('reasoning.step.end');
-    // The 'before' and ' after' still arrive as content.delta segments.
     const contentText = events
-      .filter((e): e is Extract<BusEvent, { kind: 'content.delta' }> => e.kind === 'content.delta')
+      .filter(
+        (e): e is Extract<BusEvent, { kind: 'content.delta' }> =>
+          e.kind === 'content.delta',
+      )
       .map((e) => e.delta)
       .join('');
     expect(contentText).toMatch(/before/);
