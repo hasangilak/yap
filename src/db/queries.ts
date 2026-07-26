@@ -1181,3 +1181,21 @@ export async function listEventsSince(
   });
   return rows.map((r) => r.payload as unknown as BusEvent);
 }
+
+/**
+ * Assistant nodes still marked `streaming` — i.e. turns that were mid-flight
+ * when the process last stopped.
+ *
+ * Used only by boot recovery. Before the graph runtime there was nothing that
+ * could act on these rows, so a turn interrupted by a restart stayed
+ * `streaming: true` forever with no code path that revisited it.
+ */
+export async function listUnfinishedAssistantNodes(): Promise<
+  { id: string; conversationId: string }[]
+> {
+  return getPrisma().node.findMany({
+    where: { role: 'asst', streaming: true },
+    select: { id: true, conversationId: true },
+    orderBy: { createdAt: 'asc' },
+  });
+}

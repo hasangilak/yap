@@ -1,97 +1,81 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
-import { Ollama, type Message as OllamaMessage } from 'ollama';
-import { config } from '../config.js';
-import { newEventId } from '../events/types.js';
-import { executeTool, isSideEffectful, OLLAMA_TOOLS, TOOL_DEFS } from '../registry/tools.js';
+import { Command } from '@langchain/langgraph';
 import {
-  getAgentPermission,
-  getAgentRaw,
   getConversationRaw,
-  hasGrant,
-  insertApproval,
-  insertClarify,
-  insertGrant,
   insertNode,
-  recordArtifactWrite,
-  recordClarifyResponse,
   updateConversationPointers,
-  updateNode,
   walkChain,
 } from '../db/queries.js';
-import { awaitDecision } from './approvals.js';
-import { awaitAnswer } from './clarifications.js';
-import { ThinkSplitter } from './think-splitter.js';
-import { DEFAULT_SYSTEM_PROMPT } from '../system-prompt.js';
-import type {
-  ApprovalData,
-  BusEvent,
-  ClarifyData,
-  MessageNode,
-  ToolCallData,
-} from '../schemas/index.js';
+import { envelope } from './graph/emit.js';
+import { getTurnGraph, turnConfig } from './graph/index.js';
+import { clearSteering } from './graph/steering.js';
+import type { BusEvent } from '../events/types.js';
+import type { MessageNode } from '../schemas/index.js';
 
-const ollama = new Ollama({ host: config.ollamaHost });
-
-// Tiny façade so the clarify branch can write the node's embedded
-// clarify JSON without widening updateNode's signature for a Phase 5a
-// concern. This goes away once Phase 5a+ consolidates clarify storage.
-async function getPrismaFacadeUpdateClarify(
-  nodeId: string,
-  clarify: ClarifyData,
-): Promise<void> {
-  const { getPrisma } = await import('../db/index.js');
-  await getPrisma().node.update({
-    where: { id: nodeId },
-    data: { clarify: clarify as unknown as Prisma.InputJsonValue },
-  });
-}
+/**
+ * The turn runtime's public surface.
+ *
+ * These functions keep the signatures the API layer has always used, but the
+ * loop behind them is now a LangGraph `StateGraph` (`./graph/`) checkpointed to
+ * Postgres. The reason for the change: pauses for human input used to be
+ * in-process promises, so a restart stranded the turn forever.
+ *
+ * **One semantic change callers must understand.** A LangGraph stream
+ * terminates when a node calls `interrupt()`, so this generator now completes
+ * when the turn *pauses* — not only when it finishes. "The generator ended"
+ * therefore no longer means "the turn ended". The continuation is a separate
+ * `resumeTurn()` call made by whichever endpoint receives the human's answer,
+ * and it publishes its own events.
+ *
+ * Nothing downstream breaks because of this: `api/messages.ts` only waits for
+ * the first `node.created`, and `api/stream.ts` follows the conversation on the
+ * event bus rather than following a producer.
+ */
 
 function newNodeId(): string {
   return `n-${randomUUID().slice(0, 8)}`;
 }
 
-function envelope(conversation_id: string): { id: string; at: number; conversation_id: string } {
-  return { id: newEventId(), at: Date.now(), conversation_id };
-}
-
-interface OllamaToolCall {
-  function: { name: string; arguments: Record<string, unknown> };
-}
-
 /**
- * Approval decision under the three-layer model in docs/server-spec.md §6:
- * session grant → agent permission_default → agent-level tool auto flag.
- * Phase 2 pools agent-level auto into the global TOOL_DEFS.auto flag
- * because chat-box's Agent type has no per-tool overrides yet; Phase 4's
- * agent builder will split them.
+ * Drain a graph stream, yielding the `BusEvent`s its nodes emitted on the
+ * `custom` channel.
+ *
+ * The stream must always be drained: an unconsumed `IterableReadableStream`
+ * applies backpressure and stalls the run. Errors escaping a node are turned
+ * into a terminal `error` event so a failure reaches the client instead of
+ * only the server log.
  */
-async function isAutoApproved(agentId: string, toolName: string): Promise<boolean> {
-  if (await hasGrant(agentId, toolName)) return true;
-  const perm = await getAgentPermission(agentId);
-  if (perm === 'auto_allow_all') return true;
-  if (isSideEffectful(toolName)) return false;
-  if (perm === 'auto_allow_read') return true;
-  const toolDef = TOOL_DEFS.find((t) => t.id === toolName);
-  return toolDef?.auto === true;
+async function* drive(
+  conversationId: string,
+  asstNodeId: string,
+  input: unknown,
+): AsyncGenerator<BusEvent, void, unknown> {
+  const graph = getTurnGraph();
+  const cfg = turnConfig(asstNodeId);
+  try {
+    const stream = await graph.stream(input as never, cfg as never);
+    for await (const entry of stream as AsyncIterable<[string, unknown]>) {
+      const [mode, chunk] = entry;
+      if (mode === 'custom') yield chunk as BusEvent;
+    }
+  } catch (err) {
+    yield {
+      kind: 'error',
+      ...envelope(conversationId),
+      node_id: asstNodeId,
+      message: err instanceof Error ? err.message : String(err),
+      recoverable: false,
+    };
+  }
 }
-
-function approvalPayloadFor(toolName: string, args: Record<string, unknown>): ApprovalData {
-  const toolDef = TOOL_DEFS.find((t) => t.id === toolName);
-  const desc = toolDef?.desc ?? toolName;
-  const preview = (() => {
-    const compact = JSON.stringify(args);
-    return compact.length > 200 ? compact.slice(0, 197) + '...' : compact;
-  })();
-  return { tool: toolName, title: `Run ${toolName}`, body: desc, preview };
-}
-
-// -- public entry points -----------------------------------------------------
 
 /**
- * Run one full assistant turn triggered by a user message. Inserts the
- * user node + placeholder assistant node, then runs the agent loop to
- * completion, yielding every BusEvent the SSE stream needs.
+ * Run a full turn triggered by a new user message: append the user node, then
+ * generate the assistant reply.
+ *
+ * The user node is created here rather than inside the graph because
+ * `api/messages.ts` must return it in the HTTP response, and because it is not
+ * part of the assistant turn whose state the checkpointer owns.
  */
 export async function* runAgent(input: {
   conversationId: string;
@@ -144,9 +128,12 @@ export async function* runAgent(input: {
 }
 
 /**
- * Generate just the assistant reply for an existing user node. Used by
- * regenerate (§3.4) and edit-with-ripple (§3.2): both cases already have
- * the user turn in place and need a fresh asst reply under it.
+ * Generate just the assistant reply under an existing user node. Used by
+ * regenerate and edit-with-ripple.
+ *
+ * The assistant node id is minted here because it doubles as the graph's
+ * `thread_id` — that is what lets a later decision find this exact paused turn
+ * with nothing but an id read from a database row.
  */
 export async function* runAssistantTurn(input: {
   conversationId: string;
@@ -154,469 +141,66 @@ export async function* runAssistantTurn(input: {
   branch: string;
 }): AsyncGenerator<BusEvent, void, unknown> {
   const { conversationId, parentUserNodeId, branch } = input;
+  const asstNodeId = newNodeId();
 
-  const conv = await getConversationRaw(conversationId);
-  if (!conv) {
-    yield {
-      kind: 'error',
-      ...envelope(conversationId),
-      message: `conversation ${conversationId} not found`,
-      recoverable: false,
-    };
-    return;
-  }
-
-  // Phase 8: hard-stop before starting a turn if the conversation has
-  // already exhausted its budget. Non-recoverable — client must bump
-  // the budget (Phase 4+) to continue.
-  if (conv.tokensUsed >= conv.tokenBudget) {
-    yield {
-      kind: 'error',
-      ...envelope(conversationId),
-      message: `token budget exhausted (${conv.tokensUsed} / ${conv.tokenBudget})`,
-      recoverable: false,
-    };
-    return;
-  }
-
-  const agent = await getAgentRaw(conv.agentId);
-  const model = agent?.model ?? config.defaultModel;
-  const systemPrompt = (agent?.systemPrompt && agent.systemPrompt.trim())
-    ? agent.systemPrompt
-    : DEFAULT_SYSTEM_PROMPT;
-
-  const asstId = newNodeId();
-  const asstNode = await insertNode({
-    id: asstId,
-    conversation_id: conversationId,
-    parent_id: parentUserNodeId,
-    role: 'asst',
+  const initialState = {
+    conversationId,
+    agentId: '',
+    asstNodeId,
+    parentUserNodeId,
     branch,
-    streaming: true,
-    status: 'thinking',
-  });
-  yield { kind: 'node.created', ...envelope(conversationId), node: asstNode };
-
-  const runStart = Date.now();
-  yield {
-    kind: 'status.update',
-    ...envelope(conversationId),
-    node_id: asstId,
-    state: 'thinking',
-    elapsed_ms: 0,
+    model: '',
+    runStartedAt: Date.now(),
+    round: 0,
+    messages: [],
+    accumulatedContent: '',
+    reasoningSteps: [],
+    pendingToolCalls: [],
+    openPrompts: [],
+    promptResponses: {},
+    resolvedToolCalls: [],
+    interjections: [],
+    pendingApproved: false,
+    done: false,
   };
 
-  const chain = await walkChain(conversationId, parentUserNodeId);
-  const history: OllamaMessage[] = [{ role: 'system', content: systemPrompt }];
-  for (const m of chain) {
-    history.push({
-      role: m.role === 'asst' ? 'assistant' : 'user',
-      content: m.content,
-    });
-  }
+  yield* drive(conversationId, asstNodeId, initialState);
+}
 
-  let accumulated = '';
-  const reasoningSteps: string[] = [];
-  const reasoningBuffer: string[] = [];
-  const finalToolCalls: ToolCallData[] = [];
+/**
+ * Continue a paused turn once a human has answered.
+ *
+ * Called by the approval/clarify endpoints. Because the pause lives in the
+ * checkpointer rather than in a promise, this works from any request, long
+ * after the original one returned, and across a process restart.
+ */
+export async function* resumeTurn(input: {
+  conversationId: string;
+  asstNodeId: string;
+  resume: unknown;
+}): AsyncGenerator<BusEvent, void, unknown> {
+  const { conversationId, asstNodeId, resume } = input;
+  yield* drive(conversationId, asstNodeId, new Command({ resume }));
+}
 
-  // -- agentic loop --
-  for (let round = 0; round < config.maxToolRounds; round++) {
-    let roundContent = '';
-    const roundToolCalls: OllamaToolCall[] = [];
-    const splitter = new ThinkSplitter();
+/**
+ * Continue a turn that stopped without asking for anything — a crash between
+ * supersteps rather than a pause.
+ *
+ * Distinct from `resumeTurn` because the input differs in kind: a paused turn
+ * needs `Command({resume})` to satisfy the waiting `interrupt()`, whereas a
+ * crashed one needs `null`, which replays from the last completed superstep.
+ * Passing a resume value to a thread with no pending interrupt would be
+ * meaningless.
+ */
+export async function* continueTurn(input: {
+  conversationId: string;
+  asstNodeId: string;
+}): AsyncGenerator<BusEvent, void, unknown> {
+  yield* drive(input.conversationId, input.asstNodeId, null);
+}
 
-    // Helper: dispatch splitter segments to events + accumulators.
-    const dispatch = (segments: ReturnType<ThinkSplitter['feed']>): BusEvent[] => {
-      const events: BusEvent[] = [];
-      for (const seg of segments) {
-        if (seg.type === 'content') {
-          accumulated += seg.text;
-          roundContent += seg.text;
-          events.push({
-            kind: 'content.delta',
-            ...envelope(conversationId),
-            node_id: asstId,
-            delta: seg.text,
-          });
-          events.push({
-            kind: 'status.update',
-            ...envelope(conversationId),
-            node_id: asstId,
-            state: 'streaming',
-            elapsed_ms: Date.now() - runStart,
-          });
-        } else if (seg.type === 'reasoning') {
-          reasoningBuffer[seg.step_index] =
-            (reasoningBuffer[seg.step_index] ?? '') + seg.text;
-          events.push({
-            kind: 'reasoning.delta',
-            ...envelope(conversationId),
-            node_id: asstId,
-            step_index: seg.step_index,
-            delta: seg.text,
-          });
-        } else {
-          // reasoning_end
-          const finalText = reasoningBuffer[seg.step_index] ?? '';
-          reasoningSteps.push(finalText);
-          events.push({
-            kind: 'reasoning.step.end',
-            ...envelope(conversationId),
-            node_id: asstId,
-            step_index: seg.step_index,
-            final_text: finalText,
-          });
-        }
-      }
-      return events;
-    };
-
-    try {
-      const stream = await ollama.chat({
-        model,
-        messages: history,
-        tools: OLLAMA_TOOLS,
-        stream: true,
-      });
-
-      // Phase 8: tool deadline — if a single round overruns, abort
-      // the ollama stream and let the catch below emit error(...).
-      const deadlineTimer = setTimeout(() => {
-        try {
-          stream.abort();
-        } catch {
-          /* ignore — stream may have finished by the time we fire */
-        }
-      }, config.toolDeadlineMs);
-
-      try {
-          for await (const part of stream) {
-          const delta = part.message?.content;
-          if (delta) {
-            for (const ev of dispatch(splitter.feed(delta))) yield ev;
-          }
-          const tcs = part.message?.tool_calls;
-          if (tcs) {
-            for (const tc of tcs) {
-              roundToolCalls.push({
-                function: {
-                  name: tc.function.name,
-                  arguments: (tc.function.arguments ?? {}) as Record<string, unknown>,
-                },
-              });
-            }
-          }
-        }
-      } finally {
-        clearTimeout(deadlineTimer);
-      }
-
-      // Drain any chars the splitter was holding back.
-      for (const ev of dispatch(splitter.flush())) yield ev;
-
-      // Phase 8: increment the conversation's token budget usage by
-      // this round's approximate token count (chars/4 rough estimate).
-      // Bumping after each round catches a runaway stream on the next
-      // iteration rather than after the whole turn finishes.
-      const roundTokens = Math.ceil(
-        (splitter.sawReasoning()
-          ? reasoningSteps.reduce((s, r) => s + r.length, 0)
-          : 0) + accumulated.length,
-      ) / 4 | 0;
-      if (roundTokens > 0) {
-        await updateConversationPointers(conversationId, {
-          updated_at: new Date(),
-        });
-        await (await import('../db/index.js')).getPrisma().conversation.update({
-          where: { id: conversationId },
-          data: { tokensUsed: { increment: roundTokens } },
-        });
-      }
-
-      await updateNode(asstId, {
-        content: accumulated,
-        ...(reasoningSteps.length > 0 ? { reasoning: reasoningSteps } : {}),
-      });
-
-      if (roundToolCalls.length === 0) break;
-
-      history.push({
-        role: 'assistant',
-        content: roundContent,
-        tool_calls: roundToolCalls,
-      });
-
-      for (const tc of roundToolCalls) {
-        const toolName = tc.function.name;
-        const args = tc.function.arguments;
-
-        // ask_clarification is modeled as a tool call the model issues,
-        // but it's really a pause-for-user mechanic — not an executable
-        // tool. Short-circuit into the clarify flow: persist a Clarify
-        // row, emit clarify.requested, block on the user's answer,
-        // push that back as the "tool result" the model sees, continue.
-        if (toolName === 'ask_clarification') {
-          const clarifyId = `cl-${randomUUID().slice(0, 8)}`;
-          const chipsRaw = Array.isArray(args.chips) ? (args.chips as unknown[]) : [];
-          const clarifyData: ClarifyData = {
-            question: String(args.question ?? 'Could you clarify?'),
-            chips: chipsRaw.map((label, i) => ({
-              id: `c-${i}`,
-              label: String(label),
-            })),
-            input: String(args.input_hint ?? ''),
-          };
-          await insertClarify({
-            id: clarifyId,
-            conversation_id: conversationId,
-            node_id: asstId,
-            question: clarifyData.question,
-            chips: clarifyData.chips,
-            input_hint: clarifyData.input,
-          });
-          await updateNode(asstId, { status: 'approval' });
-
-          yield {
-            kind: 'clarify.requested',
-            ...envelope(conversationId),
-            node_id: asstId,
-            clarify_id: clarifyId,
-            clarify: clarifyData,
-          };
-          yield {
-            kind: 'status.update',
-            ...envelope(conversationId),
-            node_id: asstId,
-            state: 'approval',
-            elapsed_ms: Date.now() - runStart,
-          };
-
-          const response = await awaitAnswer(clarifyId);
-          await recordClarifyResponse(clarifyId, response);
-
-          yield {
-            kind: 'clarify.answered',
-            ...envelope(conversationId),
-            node_id: asstId,
-            clarify_id: clarifyId,
-            response,
-          };
-
-          const pickedLabels = clarifyData.chips
-            .filter((c) => response.selected_chip_ids.includes(c.id))
-            .map((c) => c.label);
-          const summary = [
-            pickedLabels.length
-              ? `Selected: ${pickedLabels.join(', ')}.`
-              : 'No chips selected.',
-            response.text ? `Free-form: ${response.text}` : 'No free-form text.',
-          ].join(' ');
-
-          // Persist on the node so tree-view shows the answered state.
-          const answeredClarify: ClarifyData = {
-            ...clarifyData,
-            chips: clarifyData.chips.map((c) => ({
-              ...c,
-              selected: response.selected_chip_ids.includes(c.id),
-            })),
-          };
-          await updateNode(asstId, { status: null });
-          await getPrismaFacadeUpdateClarify(asstId, answeredClarify);
-
-          history.push({ role: 'tool', content: summary });
-          continue;
-        }
-
-        const proposedCall: ToolCallData = { name: toolName, args, status: 'pending' };
-        yield {
-          kind: 'toolcall.proposed',
-          ...envelope(conversationId),
-          node_id: asstId,
-          tool_call: proposedCall,
-        };
-
-        const autoApproved = await isAutoApproved(conv.agentId, toolName);
-        let denied = false;
-        if (!autoApproved) {
-          const approvalId = `ap-${randomUUID().slice(0, 8)}`;
-          const approvalPayload = approvalPayloadFor(toolName, args);
-          await insertApproval({
-            id: approvalId,
-            conversation_id: conversationId,
-            node_id: asstId,
-            tool: approvalPayload.tool,
-            title: approvalPayload.title,
-            body: approvalPayload.body,
-            preview: approvalPayload.preview,
-          });
-          await updateNode(asstId, { status: 'approval' });
-
-          yield {
-            kind: 'approval.requested',
-            ...envelope(conversationId),
-            node_id: asstId,
-            approval_id: approvalId,
-            approval: approvalPayload,
-          };
-          yield {
-            kind: 'status.update',
-            ...envelope(conversationId),
-            node_id: asstId,
-            state: 'approval',
-            elapsed_ms: Date.now() - runStart,
-            tool: toolName,
-          };
-
-          const decision = await awaitDecision(approvalId);
-
-          yield {
-            kind: 'approval.decided',
-            ...envelope(conversationId),
-            node_id: asstId,
-            approval_id: approvalId,
-            decision,
-          };
-
-          if (decision === 'always') {
-            await insertGrant(conv.agentId, toolName);
-          }
-          if (decision === 'deny') denied = true;
-        }
-
-        if (denied) {
-          const deniedCall: ToolCallData = {
-            name: toolName,
-            args,
-            status: 'err',
-            elapsed: '0.0s',
-          };
-          finalToolCalls.push(deniedCall);
-          await updateNode(asstId, { tool_call: deniedCall, status: null });
-          yield {
-            kind: 'toolcall.ended',
-            ...envelope(conversationId),
-            node_id: asstId,
-            status: 'err',
-            elapsed_ms: 0,
-            error: 'Denied by user',
-          };
-          history.push({
-            role: 'tool',
-            content: `The user denied the ${toolName} call. Continue without it.`,
-          });
-          continue;
-        }
-
-        await updateNode(asstId, { status: null });
-
-        yield {
-          kind: 'toolcall.started',
-          ...envelope(conversationId),
-          node_id: asstId,
-          tool: toolName,
-          args,
-        };
-        yield {
-          kind: 'status.update',
-          ...envelope(conversationId),
-          node_id: asstId,
-          state: 'tool',
-          elapsed_ms: Date.now() - runStart,
-          tool: toolName,
-        };
-
-        const exec = await executeTool(toolName, args);
-
-        const finalStatus = exec.status === 'ok' ? 'ok' : 'err';
-        const finalizedCall: ToolCallData = {
-          name: toolName,
-          args,
-          status: finalStatus,
-          elapsed: `${(exec.elapsed_ms / 1000).toFixed(1)}s`,
-          ...(exec.result ? { result: exec.result } : {}),
-        };
-        finalToolCalls.push(finalizedCall);
-        await updateNode(asstId, { tool_call: finalizedCall });
-
-        yield {
-          kind: 'toolcall.ended',
-          ...envelope(conversationId),
-          node_id: asstId,
-          status: finalStatus,
-          elapsed_ms: exec.elapsed_ms,
-          ...(exec.result !== undefined ? { result: exec.result } : {}),
-          ...(exec.error !== undefined ? { error: exec.error } : {}),
-        };
-
-        // Phase 6: write_file promotes to a versioned artifact. We
-        // recompute content from args so we don't rely on the tool
-        // result string carrying the bytes.
-        if (
-          toolName === 'write_file' &&
-          finalStatus === 'ok' &&
-          typeof args.path === 'string' &&
-          typeof args.content === 'string'
-        ) {
-          try {
-            const { artifact, version } = await recordArtifactWrite({
-              conversation_id: conversationId,
-              title: args.path,
-              content: args.content,
-              author: 'asst',
-              produced_by_node_id: asstId,
-              message: `Written by ${toolName}`,
-            });
-            yield {
-              kind: 'artifact.updated',
-              ...envelope(conversationId),
-              artifact_id: artifact.id,
-              version_id: version.id,
-              version: version.version,
-              title: artifact.title,
-            };
-          } catch (err) {
-            // Artifact bookkeeping failure shouldn't kill the turn;
-            // log and continue so the user still gets a reply.
-            console.error('[artifact]', err);
-          }
-        }
-
-        history.push({
-          role: 'tool',
-          content: exec.result ?? exec.error ?? '',
-        });
-      }
-    } catch (err) {
-      await updateNode(asstId, { streaming: false, status: null });
-      yield {
-        kind: 'error',
-        ...envelope(conversationId),
-        node_id: asstId,
-        message: err instanceof Error ? err.message : String(err),
-        recoverable: false,
-      };
-      return;
-    }
-  }
-
-  const finalized = await updateNode(asstId, { streaming: false, status: null });
-  await updateConversationPointers(conversationId, {
-    active_leaf_id: asstId,
-    snippet: accumulated.slice(0, 80),
-    updated_at: new Date(),
-  });
-  if (finalized) {
-    yield {
-      kind: 'node.finalized',
-      ...envelope(conversationId),
-      node_id: asstId,
-      node: finalized,
-    };
-  }
-  yield {
-    kind: 'active_leaf.changed',
-    ...envelope(conversationId),
-    active_leaf_id: asstId,
-  };
+/** Release process-local steering state for a finished turn. */
+export function releaseTurn(asstNodeId: string): void {
+  clearSteering(asstNodeId);
 }
