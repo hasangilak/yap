@@ -52,24 +52,36 @@ function mapEvent(ev: BusEvent): TimelineEvent | null {
         sub: `${(ev.elapsed_ms / 1000).toFixed(1)}s · ${ev.status}`,
         status: ev.status === 'ok' ? 'ok' : ev.status === 'err' ? 'err' : null,
       };
-    case 'approval.decided':
+    case 'prompt.responded': {
+      if (ev.response.prompt_kind === 'clarify') {
+        const { answer } = ev.response;
+        return {
+          ...common,
+          node_id: ev.node_id,
+          kind: 'clar',
+          label: truncate(answer.text || 'clarified', 60),
+          sub: `${answer.selected_chip_ids.length} chip(s)`,
+          status: 'ok',
+        };
+      }
+      const { decision, edited_args } = ev.response;
       return {
         ...common,
         node_id: ev.node_id,
         kind: 'perm',
-        label: `Approval: ${ev.decision}`,
-        sub: ev.decision === 'deny' ? 'Denied' : 'Granted',
-        status: ev.decision === 'deny' ? 'err' : 'ok',
+        label: `Approval: ${decision}`,
+        // Surface an edit here — otherwise the timeline says "Granted" for a
+        // call whose arguments the user rewrote, which is the one case where
+        // the proposed and executed call differ.
+        sub:
+          decision === 'deny'
+            ? 'Denied'
+            : edited_args
+              ? 'Granted (args edited)'
+              : 'Granted',
+        status: decision === 'deny' ? 'err' : 'ok',
       };
-    case 'clarify.answered':
-      return {
-        ...common,
-        node_id: ev.node_id,
-        kind: 'clar',
-        label: truncate(ev.response.text || 'clarified', 60),
-        sub: `${ev.response.selected_chip_ids.length} chip(s)`,
-        status: 'ok',
-      };
+    }
     case 'node.finalized':
       return {
         ...common,

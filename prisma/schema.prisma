@@ -163,46 +163,45 @@ model AgentVersion {
   @@map("agent_versions")
 }
 
-/// Phase 2: one row per proposed tool call that needs user approval.
-/// The conversation is paused until `decision` is set; the runtime
-/// awaits a POST /approvals/:id/decide call that fills this in and
-/// resolves the pending promise.
-model Approval {
+/// One row per pause awaiting a human — a tool call needing approval, or an
+/// `ask_clarification` question. Replaces the former separate `Approval` and
+/// `Clarify` models: the graph handles both identically (persist the row,
+/// `interrupt()`, resume with the response), so the fork existed only because
+/// the two pauses were built in different phases. One table with a `kind`
+/// discriminator means a resume path, a recovery scan, and a "what is this
+/// turn waiting on?" query each have one shape instead of two.
+///
+/// The row is the durable record of the pause; the graph checkpoint is the
+/// durable record of *where the turn was* when it paused. Both are needed:
+/// this table answers "what is being asked" for the UI, the checkpoint
+/// answers "how to continue".
+model Prompt {
   id             String    @id
   conversationId String    @map("conversation_id")
   nodeId         String    @map("node_id")
+  /// The graph thread this pause belongs to. Equal to `nodeId` today (one
+  /// thread per turn), stored explicitly so multi-agent subgraph threads can
+  /// diverge from the node they surface on without a migration.
+  threadId       String    @map("thread_id")
+  /// LangGraph's interrupt id, when the resume path knows it. Lets a response
+  /// target one specific interrupt once several are open at once.
+  interruptId    String?   @map("interrupt_id")
+  /// 'approval' | 'clarify'
+  kind           String
+  /// Tool that triggered the pause. `ask_clarification` for clarify prompts.
   tool           String
-  title          String
-  body           String
-  preview        String?
-  decision       String?
-  decidedAt      DateTime? @map("decided_at")
-  /// When decision='always', this is the key stored in ApprovalGrant so
-  /// future calls skip approval entirely.
-  rememberKey    String?   @map("remember_key")
-  createdAt      DateTime  @default(now()) @map("created_at")
-
-  @@index([conversationId])
-  @@map("approvals")
-}
-
-/// Phase 5a: one row per ask_clarification tool call that's waiting
-/// on a structured user answer. `response` holds the selected chip
-/// ids + free-form text once the user hits Send via
-/// POST /clarify/:id/answer.
-model Clarify {
-  id             String    @id
-  conversationId String    @map("conversation_id")
-  nodeId         String    @map("node_id")
-  question       String
-  chips          Json
-  inputHint      String    @default("") @map("input_hint")
+  /// Kind-specific request data: ApprovalData or ClarifyData.
+  payload        Json
+  /// Kind-specific answer: {decision, edited_args?} or {selected_chip_ids,
+  /// text}. Null until answered — the presence of this field is what makes a
+  /// double-response a 409 rather than a second resume.
   response       Json?
   respondedAt    DateTime? @map("responded_at")
   createdAt      DateTime  @default(now()) @map("created_at")
 
   @@index([conversationId])
-  @@map("clarifications")
+  @@index([nodeId])
+  @@map("prompts")
 }
 
 /// Phase 8: idempotency record for mutating POST/PATCH/DELETE. Clients

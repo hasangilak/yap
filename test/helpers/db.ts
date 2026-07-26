@@ -11,8 +11,8 @@ export async function truncateAll(): Promise<void> {
   await prisma.$executeRawUnsafe(
     `TRUNCATE
        conversations, nodes, agents, agent_versions,
-       events, approvals, approval_grants,
-       clarifications, artifacts, artifact_versions,
+       events, prompts, approval_grants,
+       artifacts, artifact_versions,
        tags, conversation_tags, thread_notes, pinned_snippets,
        idempotency_records
      CASCADE`,

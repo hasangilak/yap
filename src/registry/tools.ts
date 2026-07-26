@@ -201,9 +201,11 @@ export async function executeTool(
 }
 
 /**
- * Tools whose execution has visible side effects (writes, sends,
- * executes). Phase 1 auto-approves read-only tools; Phase 2 will gate
- * these behind an approval.requested / approval.decided round-trip.
+ * Tools whose execution has visible side effects (writes, sends, executes).
+ * These never auto-approve on the tool's own authority — a call to one is
+ * routed through the `prompt.requested` / `prompt.responded` round-trip unless
+ * a higher layer of the permission model (a standing grant, or an agent set to
+ * `auto_allow_all`) allows it. See `graph/nodes.ts#isAutoApproved`.
  */
 export function isSideEffectful(toolName: string): boolean {
   return ['write_file', 'run_tests', 'send_email'].includes(toolName);

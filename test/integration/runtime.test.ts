@@ -72,14 +72,19 @@ vi.mock('../../src/tools/browser.js', () => ({
   webBack: vi.fn(async () => 'stub back'),
 }));
 
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { resumeTurn, runAgent } from '../../src/runtime/run.js';
 import { setupCheckpointer } from '../../src/runtime/graph/checkpointer.js';
 import { getPendingInterrupts } from '../../src/runtime/graph/index.js';
+import { config } from '../../src/config.js';
 import {
   firstAgentId,
   getConversationRaw,
+  getPrompt,
   insertAgent,
   insertConversation,
+  listPrompts,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
 import {
@@ -179,8 +184,8 @@ describe('runtime — tool call flow', () => {
     const ended = events.find((e) => e.kind === 'toolcall.ended');
     expect(ended).toBeDefined();
     expect((ended as { status: string }).status).toBe('ok');
-    // No approval because web_search is auto-approved.
-    expect(kinds).not.toContain('approval.requested');
+    // No prompt because web_search is auto-approved.
+    expect(kinds).not.toContain('prompt.requested');
   });
 
   it('write_file pauses the turn on an interrupt rather than blocking in-process', async () => {
@@ -203,12 +208,24 @@ describe('runtime — tool call flow', () => {
     const first = await drain(
       runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
     );
-    const approvalEv = first.find((e) => e.kind === 'approval.requested');
-    expect(approvalEv).toBeDefined();
+    const promptEv = first.find((e) => e.kind === 'prompt.requested');
+    expect(promptEv).toBeDefined();
+    expect(promptEv).toMatchObject({
+      tool: 'write_file',
+      request: { prompt_kind: 'approval' },
+    });
 
     // The pause is durable: it lives in the checkpointer, not in memory.
-    const asstId = (approvalEv as { node_id: string }).node_id;
+    const asstId = (promptEv as { node_id: string }).node_id;
     expect(await getPendingInterrupts(asstId)).toHaveLength(1);
+
+    // The row backing the prompt is written before the pause, so a client can
+    // find out what is being asked without replaying the event stream.
+    const promptId = (promptEv as { prompt_id: string }).prompt_id;
+    const row = await getPrompt(promptId);
+    expect(row).toMatchObject({ kind: 'approval', tool: 'write_file', nodeId: asstId });
+    expect(row?.response).toBeNull();
+    expect(await listPrompts('c-r', true)).toHaveLength(1);
 
     // Only one model round happened; the turn is genuinely parked.
     expect(STREAM_CALLS).toHaveLength(1);
@@ -232,15 +249,19 @@ describe('runtime — tool call flow', () => {
     const first = await drain(
       runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
     );
-    const approvalEv = first.find((e) => e.kind === 'approval.requested');
-    const asstId = (approvalEv as { node_id: string }).node_id;
+    const promptEv = first.find((e) => e.kind === 'prompt.requested');
+    const asstId = (promptEv as { node_id: string }).node_id;
 
     const second = await drain(
-      resumeTurn({ conversationId: 'c-r', asstNodeId: asstId, resume: 'deny' }),
+      resumeTurn({
+        conversationId: 'c-r',
+        asstNodeId: asstId,
+        resume: { prompt_kind: 'approval', decision: 'deny' },
+      }),
     );
 
     const kinds = second.map((e) => e.kind);
-    expect(kinds).toContain('approval.decided');
+    expect(kinds).toContain('prompt.responded');
     const ended = second.find((e) => e.kind === 'toolcall.ended');
     expect((ended as { status: string }).status).toBe('err');
     expect((ended as { error?: string }).error).toMatch(/denied/i);
@@ -268,11 +289,15 @@ describe('runtime — tool call flow', () => {
       runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
     );
     const asstId = (
-      first.find((e) => e.kind === 'approval.requested') as { node_id: string }
+      first.find((e) => e.kind === 'prompt.requested') as { node_id: string }
     ).node_id;
 
     const second = await drain(
-      resumeTurn({ conversationId: 'c-r', asstNodeId: asstId, resume: 'allow' }),
+      resumeTurn({
+        conversationId: 'c-r',
+        asstNodeId: asstId,
+        resume: { prompt_kind: 'approval', decision: 'allow' },
+      }),
     );
     const kinds = second.map((e) => e.kind);
     expect(kinds).toContain('toolcall.started');
@@ -281,6 +306,117 @@ describe('runtime — tool call flow', () => {
     expect(kinds).toContain('node.finalized');
     // Nothing is left pending once the turn is done.
     expect(await getPendingInterrupts(asstId)).toHaveLength(0);
+  });
+
+  /**
+   * Edit-then-approve. The point of the assertion is that the tool ran with
+   * the human's args, not the model's — so `toolcall.started` must carry the
+   * edited path, and the file the model asked for must not exist.
+   */
+  it('edited_args replace the proposed args before the tool runs', async () => {
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'model-chose.txt', content: 'from model' },
+            },
+          },
+        ],
+      },
+    ]);
+    CHAT_SCRIPTS.push([{ content: 'Done.' }]);
+
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const asstId = (
+      first.find((e) => e.kind === 'prompt.requested') as { node_id: string }
+    ).node_id;
+
+    const second = await drain(
+      resumeTurn({
+        conversationId: 'c-r',
+        asstNodeId: asstId,
+        resume: {
+          prompt_kind: 'approval',
+          decision: 'allow',
+          edited_args: { path: 'human-chose.txt', content: 'from human' },
+        },
+      }),
+    );
+
+    const started = second.find((e) => e.kind === 'toolcall.started');
+    expect(started).toMatchObject({
+      tool: 'write_file',
+      args: { path: 'human-chose.txt', content: 'from human' },
+    });
+    expect((second.find((e) => e.kind === 'toolcall.ended') as { status: string }).status)
+      .toBe('ok');
+
+    // The response event carries the edit, so a client rebuilding history from
+    // the stream shows what actually ran rather than what was proposed.
+    expect(second.find((e) => e.kind === 'prompt.responded')).toMatchObject({
+      response: {
+        prompt_kind: 'approval',
+        decision: 'allow',
+        edited_args: { path: 'human-chose.txt' },
+      },
+    });
+
+    const written = await readFile(
+      join(config.artifactsDir, 'human-chose.txt'),
+      'utf8',
+    );
+    expect(written).toBe('from human');
+    await expect(
+      readFile(join(config.artifactsDir, 'model-chose.txt'), 'utf8'),
+    ).rejects.toThrow();
+  });
+
+  /**
+   * Edited args are not a trust boundary bypass: `executeTool` validates paths
+   * at execution time, so the sandbox check applies to a human's edit exactly
+   * as it does to a model's proposal.
+   */
+  it('edited_args cannot escape the write_file sandbox', async () => {
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'fine.txt', content: 'ok' },
+            },
+          },
+        ],
+      },
+    ]);
+    CHAT_SCRIPTS.push([{ content: 'Could not write.' }]);
+
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const asstId = (
+      first.find((e) => e.kind === 'prompt.requested') as { node_id: string }
+    ).node_id;
+
+    const second = await drain(
+      resumeTurn({
+        conversationId: 'c-r',
+        asstNodeId: asstId,
+        resume: {
+          prompt_kind: 'approval',
+          decision: 'allow',
+          edited_args: { path: '../../escaped.txt', content: 'pwned' },
+        },
+      }),
+    );
+
+    const ended = second.find((e) => e.kind === 'toolcall.ended');
+    expect((ended as { status: string }).status).toBe('err');
+    expect((ended as { error?: string }).error).toMatch(/path|escape|outside|sandbox/i);
   });
 });
 

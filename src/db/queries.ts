@@ -11,14 +11,14 @@ import type {
   ArtifactAuthor,
   ArtifactVersion,
   BusEvent,
-  ClarifyChip,
   ClarifyData,
-  ClarifyResponse,
   Conversation,
-  Decision,
   MessageNode,
   MessageTree,
   PermissionDefault,
+  PromptKind,
+  PromptRequest,
+  PromptResponse,
   Role,
   StatusState,
   ToolCallData,
@@ -888,69 +888,121 @@ export async function getArtifactVersion(
   return row ? rowToArtifactVersion(row) : null;
 }
 
-// -- clarifications (Phase 5a) -------------------------------------------------
+// -- prompts (unified human-in-the-loop pause) --------------------------------
 
-export interface InsertClarifyInput {
+export interface InsertPromptInput {
   id: string;
   conversation_id: string;
   node_id: string;
-  question: string;
-  chips: ClarifyChip[];
-  input_hint: string;
+  thread_id: string;
+  kind: PromptKind;
+  tool: string;
+  payload: PromptRequest;
 }
 
-export async function insertClarify(input: InsertClarifyInput): Promise<void> {
-  await getPrisma().clarify.create({
+export async function insertPrompt(input: InsertPromptInput): Promise<void> {
+  await getPrisma().prompt.create({
     data: {
       id: input.id,
       conversationId: input.conversation_id,
       nodeId: input.node_id,
-      question: input.question,
-      chips: input.chips as unknown as Prisma.InputJsonValue,
-      inputHint: input.input_hint,
+      threadId: input.thread_id,
+      kind: input.kind,
+      tool: input.tool,
+      payload: input.payload as unknown as Prisma.InputJsonValue,
     },
   });
 }
 
-export interface ClarifyRow {
+export interface PromptRow {
   id: string;
   conversationId: string;
   nodeId: string;
-  question: string;
-  chips: ClarifyChip[];
-  inputHint: string;
-  response: ClarifyResponse | null;
+  threadId: string;
+  interruptId: string | null;
+  kind: PromptKind;
+  tool: string;
+  payload: PromptRequest;
+  response: PromptResponse | null;
   respondedAt: Date | null;
   createdAt: Date;
 }
 
-export async function getClarify(id: string): Promise<ClarifyRow | null> {
-  const row = await getPrisma().clarify.findUnique({ where: { id } });
-  if (!row) return null;
+function rowToPrompt(row: {
+  id: string;
+  conversationId: string;
+  nodeId: string;
+  threadId: string;
+  interruptId: string | null;
+  kind: string;
+  tool: string;
+  payload: Prisma.JsonValue;
+  response: Prisma.JsonValue | null;
+  respondedAt: Date | null;
+  createdAt: Date;
+}): PromptRow {
   return {
     id: row.id,
     conversationId: row.conversationId,
     nodeId: row.nodeId,
-    question: row.question,
-    chips: (row.chips ?? []) as unknown as ClarifyChip[],
-    inputHint: row.inputHint,
-    response: (row.response ?? null) as unknown as ClarifyResponse | null,
+    threadId: row.threadId,
+    interruptId: row.interruptId,
+    kind: row.kind as PromptKind,
+    tool: row.tool,
+    payload: row.payload as unknown as PromptRequest,
+    response: (row.response ?? null) as unknown as PromptResponse | null,
     respondedAt: row.respondedAt,
     createdAt: row.createdAt,
   };
 }
 
-export async function recordClarifyResponse(
+export async function getPrompt(id: string): Promise<PromptRow | null> {
+  const row = await getPrisma().prompt.findUnique({ where: { id } });
+  return row ? rowToPrompt(row) : null;
+}
+
+/**
+ * Prompts for a conversation, newest first. `pendingOnly` narrows to the ones
+ * still awaiting an answer — which is how a reconnecting client discovers what
+ * it needs to render without replaying the whole event log.
+ */
+export async function listPrompts(
+  conversationId: string,
+  pendingOnly = false,
+): Promise<PromptRow[]> {
+  const rows = await getPrisma().prompt.findMany({
+    where: {
+      conversationId,
+      ...(pendingOnly ? { response: { equals: Prisma.DbNull } } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  return rows.map(rowToPrompt);
+}
+
+/**
+ * Claim a prompt by writing its response, but only if it has none yet.
+ *
+ * The `response IS NULL` guard makes this a compare-and-set rather than a
+ * blind update: two simultaneous responses cannot both succeed, so the caller
+ * can use the return value to decide between resuming the turn and returning
+ * 409. A read-then-write check in the handler would let both through.
+ *
+ * Returns true if this call claimed the prompt, false if it was already
+ * answered.
+ */
+export async function recordPromptResponse(
   id: string,
-  response: ClarifyResponse,
-): Promise<void> {
-  await getPrisma().clarify.update({
-    where: { id },
+  response: PromptResponse,
+): Promise<boolean> {
+  const result = await getPrisma().prompt.updateMany({
+    where: { id, response: { equals: Prisma.DbNull } },
     data: {
       response: response as unknown as Prisma.InputJsonValue,
       respondedAt: new Date(),
     },
   });
+  return result.count > 0;
 }
 
 // -- tree operations (Phase 3) -------------------------------------------------
@@ -1052,66 +1104,7 @@ export async function rippleCounts(
   return { descendant_count: ids.length, tool_calls_to_replay: tools, approvals_required: approvals };
 }
 
-// -- approvals (Phase 2) -------------------------------------------------------
-
-export interface InsertApprovalInput {
-  id: string;
-  conversation_id: string;
-  node_id: string;
-  tool: string;
-  title: string;
-  body: string;
-  preview?: string;
-}
-
-export async function insertApproval(a: InsertApprovalInput): Promise<void> {
-  await getPrisma().approval.create({
-    data: {
-      id: a.id,
-      conversationId: a.conversation_id,
-      nodeId: a.node_id,
-      tool: a.tool,
-      title: a.title,
-      body: a.body,
-      preview: a.preview ?? null,
-    },
-  });
-}
-
-export interface ApprovalRow {
-  id: string;
-  conversationId: string;
-  nodeId: string;
-  tool: string;
-  title: string;
-  body: string;
-  preview: string | null;
-  decision: string | null;
-  decidedAt: Date | null;
-  rememberKey: string | null;
-  createdAt: Date;
-}
-
-export async function getApproval(id: string): Promise<ApprovalRow | null> {
-  return getPrisma().approval.findUnique({ where: { id } });
-}
-
-export async function recordApprovalDecision(
-  id: string,
-  decision: Decision,
-  rememberKey: string | null,
-): Promise<ApprovalRow | null> {
-  return getPrisma().approval.update({
-    where: { id },
-    data: {
-      decision,
-      decidedAt: new Date(),
-      rememberKey,
-    },
-  });
-}
-
-// -- approval grants (Phase 2) -------------------------------------------------
+// -- approval grants ----------------------------------------------------------
 
 const LOCAL_USER = 'local';
 

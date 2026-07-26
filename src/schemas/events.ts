@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   ApprovalDataSchema,
+  ClarifyDataSchema,
   DecisionSchema,
   MessageNodeSchema,
   StatusStateSchema,
@@ -80,46 +81,76 @@ export const ActiveLeafChangedEventSchema = Base.extend({
   active_leaf_id: z.string(),
 });
 
-export const ApprovalRequestedEventSchema = Base.extend({
-  kind: z.literal('approval.requested'),
-  node_id: z.string(),
-  approval_id: z.string(),
-  approval: ApprovalDataSchema,
-});
+// -- prompts (the unified human-in-the-loop pause) ----------------------------
 
-export const ApprovalDecidedEventSchema = Base.extend({
-  kind: z.literal('approval.decided'),
-  node_id: z.string(),
-  approval_id: z.string(),
-  decision: DecisionSchema,
-});
+/**
+ * `approval.requested`/`approval.decided`/`clarify.requested`/`clarify.answered`
+ * collapsed into `prompt.requested`/`prompt.responded`.
+ *
+ * The kind-specific data sits under a nested `request`/`response` object rather
+ * than as sibling optional fields, because that is what narrows in TypeScript:
+ * `ev.request.prompt_kind === 'approval'` proves `ev.request.approval` exists.
+ * A flat shape with two optionals would compile but let a malformed event —
+ * `prompt_kind: 'approval'` with no approval data — pass validation.
+ *
+ * `kind` remains the single top-level discriminator of `BusEvent`, so
+ * `prompt_kind` discriminates only within the nested object.
+ */
+export const PromptKindSchema = z.enum(['approval', 'clarify']);
+export type PromptKind = z.infer<typeof PromptKindSchema>;
 
-export const ClarifyResponseSchema = z.object({
+export const PromptRequestSchema = z.discriminatedUnion('prompt_kind', [
+  z.object({
+    prompt_kind: z.literal('approval'),
+    approval: ApprovalDataSchema,
+  }),
+  z.object({
+    prompt_kind: z.literal('clarify'),
+    clarify: ClarifyDataSchema,
+  }),
+]);
+export type PromptRequest = z.infer<typeof PromptRequestSchema>;
+
+/** The free-form part of a clarify answer, shared by the event and the row. */
+export const ClarifyAnswerSchema = z.object({
   selected_chip_ids: z.array(z.string()),
   text: z.string(),
 });
-export type ClarifyResponse = z.infer<typeof ClarifyResponseSchema>;
+export type ClarifyAnswer = z.infer<typeof ClarifyAnswerSchema>;
 
-export const ClarifyRequestedEventSchema = Base.extend({
-  kind: z.literal('clarify.requested'),
-  node_id: z.string(),
-  clarify_id: z.string(),
-  clarify: z.object({
-    question: z.string(),
-    chips: z.array(z.object({
-      id: z.string(),
-      label: z.string(),
-      selected: z.boolean().optional(),
-    })),
-    input: z.string(),
+export const PromptResponseSchema = z.discriminatedUnion('prompt_kind', [
+  z.object({
+    prompt_kind: z.literal('approval'),
+    decision: DecisionSchema,
+    /**
+     * Present only when the human changed the args before approving. The tool
+     * ran with these, not with what the model proposed — so a client rendering
+     * history must show these to be accurate about what happened.
+     */
+    edited_args: z.record(z.string(), z.unknown()).optional(),
   }),
+  z.object({
+    prompt_kind: z.literal('clarify'),
+    answer: ClarifyAnswerSchema,
+  }),
+]);
+export type PromptResponse = z.infer<typeof PromptResponseSchema>;
+
+export const PromptRequestedEventSchema = Base.extend({
+  kind: z.literal('prompt.requested'),
+  node_id: z.string(),
+  prompt_id: z.string(),
+  /** The tool that triggered the pause; `ask_clarification` for clarify. */
+  tool: z.string(),
+  request: PromptRequestSchema,
 });
 
-export const ClarifyAnsweredEventSchema = Base.extend({
-  kind: z.literal('clarify.answered'),
+export const PromptRespondedEventSchema = Base.extend({
+  kind: z.literal('prompt.responded'),
   node_id: z.string(),
-  clarify_id: z.string(),
-  response: ClarifyResponseSchema,
+  prompt_id: z.string(),
+  tool: z.string(),
+  response: PromptResponseSchema,
 });
 
 export const ArtifactUpdatedEventSchema = Base.extend({
@@ -146,10 +177,8 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ToolCallProposedEventSchema,
   ToolCallStartedEventSchema,
   ToolCallEndedEventSchema,
-  ApprovalRequestedEventSchema,
-  ApprovalDecidedEventSchema,
-  ClarifyRequestedEventSchema,
-  ClarifyAnsweredEventSchema,
+  PromptRequestedEventSchema,
+  PromptRespondedEventSchema,
   ArtifactUpdatedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,

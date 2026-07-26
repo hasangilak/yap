@@ -17,7 +17,7 @@ import { continueTurn } from './run.js';
  *
  *  1. **Waiting on a human.** The checkpoint has a pending interrupt, so the
  *     turn is already durable — leave it exactly as it is. The next
- *     `POST /approvals/:id/decide` will resume it. Previously this state was
+ *     `POST /prompts/:id/respond` will resume it. Previously this state was
  *     unrecoverable: the promise died with the process.
  *  2. **Crashed mid-execution.** A checkpoint exists with work still queued but
  *     no interrupt. Resume with `null` input, which replays from the last

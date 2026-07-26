@@ -6,12 +6,11 @@ import {
   getAgentRaw,
   getConversationRaw,
   hasGrant,
-  insertApproval,
-  insertClarify,
   insertGrant,
   insertNode,
+  insertPrompt,
   recordArtifactWrite,
-  recordClarifyResponse,
+  recordPromptResponse,
   updateConversationPointers,
   updateNode,
   walkChain,
@@ -24,10 +23,9 @@ import {
 import type {
   ApprovalData,
   ClarifyData,
-  Decision,
+  PromptResponse,
   ToolCallData,
 } from '../../schemas/index.js';
-import type { ClarifyResponse } from '../../schemas/events.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../../system-prompt.js';
 import { envelope, makeEmit } from './emit.js';
 import { streamModelRound } from './model.js';
@@ -296,23 +294,25 @@ export async function gateNode(
 
   // `ask_clarification` is not an executable tool — it is a pause mechanic.
   if (call.name === 'ask_clarification') {
-    const clarifyId = `cl-${randomUUID().slice(0, 8)}`;
+    const promptId = `pr-${randomUUID().slice(0, 8)}`;
     const clarifyData = clarifyDataFrom(call.args);
-    await insertClarify({
-      id: clarifyId,
+    await insertPrompt({
+      id: promptId,
       conversation_id: conversationId,
       node_id: asstNodeId,
-      question: clarifyData.question,
-      chips: clarifyData.chips,
-      input_hint: clarifyData.input,
+      thread_id: asstNodeId,
+      kind: 'clarify',
+      tool: call.name,
+      payload: { prompt_kind: 'clarify', clarify: clarifyData },
     });
     await updateNode(asstNodeId, { status: 'approval' });
     emit({
-      kind: 'clarify.requested',
+      kind: 'prompt.requested',
       ...envelope(conversationId),
       node_id: asstNodeId,
-      clarify_id: clarifyId,
-      clarify: clarifyData,
+      prompt_id: promptId,
+      tool: call.name,
+      request: { prompt_kind: 'clarify', clarify: clarifyData },
     });
     emit({
       kind: 'status.update',
@@ -322,7 +322,7 @@ export async function gateNode(
       elapsed_ms: Date.now() - runStartedAt,
     });
     const prompt: OpenPrompt = {
-      id: clarifyId,
+      id: promptId,
       kind: 'clarify',
       toolCallIndex: 0,
       tool: call.name,
@@ -346,24 +346,25 @@ export async function gateNode(
     return { openPrompts: [], pendingApproved: true };
   }
 
-  const approvalId = `ap-${randomUUID().slice(0, 8)}`;
+  const promptId = `pr-${randomUUID().slice(0, 8)}`;
   const payload = approvalPayloadFor(call.name, call.args);
-  await insertApproval({
-    id: approvalId,
+  await insertPrompt({
+    id: promptId,
     conversation_id: conversationId,
     node_id: asstNodeId,
+    thread_id: asstNodeId,
+    kind: 'approval',
     tool: call.name,
-    title: payload.title,
-    body: payload.body,
-    preview: payload.preview,
+    payload: { prompt_kind: 'approval', approval: payload },
   });
   await updateNode(asstNodeId, { status: 'approval' });
   emit({
-    kind: 'approval.requested',
+    kind: 'prompt.requested',
     ...envelope(conversationId),
     node_id: asstNodeId,
-    approval_id: approvalId,
-    approval: payload,
+    prompt_id: promptId,
+    tool: call.name,
+    request: { prompt_kind: 'approval', approval: payload },
   });
   emit({
     kind: 'status.update',
@@ -374,7 +375,7 @@ export async function gateNode(
   });
 
   const prompt: OpenPrompt = {
-    id: approvalId,
+    id: promptId,
     kind: 'approval',
     toolCallIndex: 0,
     tool: call.name,
@@ -405,6 +406,13 @@ export async function waitNode(state: TurnStateValue) {
  * Apply the human's answer: announce it, and decide whether the gated call
  * runs. Sets `pendingApproved` for the conditional edge rather than returning
  * a route, so the decision survives the checkpoint.
+ *
+ * The response arrives already tagged (`PromptResponse`), so this node narrows
+ * on the answer itself rather than trusting `prompt.kind` to agree with it.
+ *
+ * The row is **not** written here — `POST /prompts/:id/respond` persists the
+ * response before resuming, which is what makes an answer survive a crash in
+ * between. Writing it again here would only move `responded_at`.
  */
 export async function resolvePromptNode(
   state: TurnStateValue,
@@ -416,26 +424,27 @@ export async function resolvePromptNode(
   const call = state.pendingToolCalls[0];
   if (!prompt || !call) return { openPrompts: [], pendingApproved: false };
 
-  const answer = state.promptResponses[prompt.id];
+  const response = state.promptResponses[prompt.id] as PromptResponse | undefined;
+  if (!response) return { openPrompts: [], pendingApproved: false };
 
-  if (prompt.kind === 'clarify') {
-    const response = answer as ClarifyResponse;
-    await recordClarifyResponse(prompt.id, response);
-    emit({
-      kind: 'clarify.answered',
-      ...envelope(conversationId),
-      node_id: asstNodeId,
-      clarify_id: prompt.id,
-      response,
-    });
+  emit({
+    kind: 'prompt.responded',
+    ...envelope(conversationId),
+    node_id: asstNodeId,
+    prompt_id: prompt.id,
+    tool: prompt.tool,
+    response,
+  });
 
+  if (response.prompt_kind === 'clarify') {
+    const { answer } = response;
     const clarifyData = clarifyDataFrom(call.args);
     const picked = clarifyData.chips
-      .filter((c) => response.selected_chip_ids.includes(c.id))
+      .filter((c) => answer.selected_chip_ids.includes(c.id))
       .map((c) => c.label);
     const summary = [
       picked.length ? `Selected: ${picked.join(', ')}.` : 'No chips selected.',
-      response.text ? `Free-form: ${response.text}` : 'No free-form text.',
+      answer.text ? `Free-form: ${answer.text}` : 'No free-form text.',
     ].join(' ');
 
     await updateNode(asstNodeId, { status: null });
@@ -447,7 +456,7 @@ export async function resolvePromptNode(
           ...clarifyData,
           chips: clarifyData.chips.map((c) => ({
             ...c,
-            selected: response.selected_chip_ids.includes(c.id),
+            selected: answer.selected_chip_ids.includes(c.id),
           })),
         } as never,
       },
@@ -461,14 +470,7 @@ export async function resolvePromptNode(
     };
   }
 
-  const decision = answer as Decision;
-  emit({
-    kind: 'approval.decided',
-    ...envelope(conversationId),
-    node_id: asstNodeId,
-    approval_id: prompt.id,
-    decision,
-  });
+  const { decision } = response;
   if (decision === 'always') await insertGrant(state.agentId, prompt.tool);
 
   if (decision === 'deny') {
@@ -502,6 +504,25 @@ export async function resolvePromptNode(
   }
 
   await updateNode(asstNodeId, { status: null });
+
+  // Edit-then-approve: swap the proposed args for the human's before the call
+  // reaches `execute`. Nothing about safety rests on this substitution —
+  // `executeTool` validates at execution time, so `write_file`'s sandbox check
+  // applies to edited args exactly as it does to model-proposed ones.
+  //
+  // Note the in-turn `messages` history keeps the assistant's *original*
+  // tool_calls. That is deliberate: the history records what the model said,
+  // while the node row, `toolcall.started`, and `prompt.responded` all carry
+  // what actually ran.
+  if (response.edited_args) {
+    const edited: NormalizedToolCall = { ...call, args: response.edited_args };
+    return {
+      pendingToolCalls: [edited, ...state.pendingToolCalls.slice(1)],
+      openPrompts: [],
+      pendingApproved: true,
+    };
+  }
+
   return { openPrompts: [], pendingApproved: true };
 }
 

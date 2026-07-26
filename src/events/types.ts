@@ -9,6 +9,8 @@ export {
   ToolCallProposedEventSchema,
   ToolCallStartedEventSchema,
   ToolCallEndedEventSchema,
+  PromptRequestedEventSchema,
+  PromptRespondedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,

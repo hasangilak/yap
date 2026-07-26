@@ -138,31 +138,56 @@ describe('schemas — BusEvent discriminated union', () => {
       },
       {
         ...base,
-        kind: 'approval.requested',
+        kind: 'prompt.requested',
         node_id: 'n',
-        approval_id: 'ap',
-        approval: { tool: 'w', title: 't', body: 'b' },
+        prompt_id: 'pr',
+        tool: 'write_file',
+        request: {
+          prompt_kind: 'approval',
+          approval: { tool: 'w', title: 't', body: 'b' },
+        },
       },
       {
         ...base,
-        kind: 'approval.decided',
+        kind: 'prompt.requested',
         node_id: 'n',
-        approval_id: 'ap',
-        decision: 'allow',
+        prompt_id: 'pr',
+        tool: 'ask_clarification',
+        request: {
+          prompt_kind: 'clarify',
+          clarify: { question: 'q', chips: [], input: '' },
+        },
       },
       {
         ...base,
-        kind: 'clarify.requested',
+        kind: 'prompt.responded',
         node_id: 'n',
-        clarify_id: 'cl',
-        clarify: { question: 'q', chips: [], input: '' },
+        prompt_id: 'pr',
+        tool: 'write_file',
+        response: { prompt_kind: 'approval', decision: 'allow' },
       },
       {
         ...base,
-        kind: 'clarify.answered',
+        kind: 'prompt.responded',
         node_id: 'n',
-        clarify_id: 'cl',
-        response: { selected_chip_ids: [], text: '' },
+        prompt_id: 'pr',
+        tool: 'write_file',
+        response: {
+          prompt_kind: 'approval',
+          decision: 'allow',
+          edited_args: { path: 'a.txt', content: 'edited' },
+        },
+      },
+      {
+        ...base,
+        kind: 'prompt.responded',
+        node_id: 'n',
+        prompt_id: 'pr',
+        tool: 'ask_clarification',
+        response: {
+          prompt_kind: 'clarify',
+          answer: { selected_chip_ids: ['c-0'], text: 'more' },
+        },
       },
       {
         ...base,
@@ -189,5 +214,39 @@ describe('schemas — BusEvent discriminated union', () => {
       kind: 'bogus',
     });
     expect(r.success).toBe(false);
+  });
+
+  /**
+   * The reason prompt payloads nest under `request`/`response` with their own
+   * `prompt_kind` discriminator rather than sitting as sibling optional fields:
+   * a mismatched pair must not validate. With optionals it would.
+   */
+  it('rejects a prompt whose kind and payload disagree', () => {
+    const base = { id: 'ev', at: 1, conversation_id: 'c-1' };
+    const mismatched = BusEventSchema.safeParse({
+      ...base,
+      kind: 'prompt.requested',
+      node_id: 'n',
+      prompt_id: 'pr',
+      tool: 'write_file',
+      request: {
+        prompt_kind: 'approval',
+        clarify: { question: 'q', chips: [], input: '' },
+      },
+    });
+    expect(mismatched.success).toBe(false);
+
+    const clarifyAnswerOnApproval = BusEventSchema.safeParse({
+      ...base,
+      kind: 'prompt.responded',
+      node_id: 'n',
+      prompt_id: 'pr',
+      tool: 'write_file',
+      response: {
+        prompt_kind: 'approval',
+        answer: { selected_chip_ids: [], text: '' },
+      },
+    });
+    expect(clarifyAnswerOnApproval.success).toBe(false);
   });
 });

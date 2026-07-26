@@ -6,23 +6,22 @@ import {
   getAgentFull,
   getAgentVersion,
   getArtifact,
-  getClarify,
   getConversation,
   getConversationRaw,
   getConversationTree,
+  getPrompt,
   hasGrant,
-  insertApproval,
   insertArtifactCall as _typeCheck, // force type import (no-op)
 } from '../../src/db/queries.js';
 import {
   firstAgentId,
   getNode,
   insertAgent,
-  insertClarify,
   insertConversation,
   insertEvent,
   insertGrant,
   insertNode,
+  insertPrompt,
   listAgentVersions,
   listAgents,
   listArtifactVersions,
@@ -31,10 +30,11 @@ import {
   listDescendantIds,
   listEventsSince,
   listGrants,
+  listPrompts,
   nextBranchName,
   patchAgent,
   recordArtifactWrite,
-  recordClarifyResponse,
+  recordPromptResponse,
   rippleCounts,
   updateConversationPointers,
   updateNode,
@@ -315,30 +315,14 @@ describe('db — agents + versions', () => {
 });
 
 // ----------------------------------------------------------------------------
-// Approvals + grants
+// Grants
 // ----------------------------------------------------------------------------
 
-describe('db — approvals + grants', () => {
+describe('db — grants', () => {
   beforeEach(async () => {
     await seedOneAgent();
     await seedOneConv();
     await insertNode({ id: 'n-x', conversation_id: 'c-seed', parent_id: null, role: 'asst', content: '' });
-  });
-
-  it('insertApproval + recordApprovalDecision update the row', async () => {
-    const { recordApprovalDecision, getApproval } = await import('../../src/db/queries.js');
-    await insertApproval({
-      id: 'ap-1',
-      conversation_id: 'c-seed',
-      node_id: 'n-x',
-      tool: 'write_file',
-      title: 't',
-      body: 'b',
-    });
-    await recordApprovalDecision('ap-1', 'allow', null);
-    const row = await getApproval('ap-1');
-    expect(row?.decision).toBe('allow');
-    expect(row?.decidedAt).toBeInstanceOf(Date);
   });
 
   it('hasGrant / insertGrant / listGrants / deleteGrant cycle', async () => {
@@ -355,34 +339,110 @@ describe('db — approvals + grants', () => {
 });
 
 // ----------------------------------------------------------------------------
-// Clarifications
+// Prompts (unified approval + clarify)
 // ----------------------------------------------------------------------------
 
-describe('db — clarifications', () => {
+describe('db — prompts', () => {
   beforeEach(async () => {
     await seedOneAgent();
     await seedOneConv();
-    await insertNode({ id: 'n-c', conversation_id: 'c-seed', parent_id: null, role: 'asst', content: '' });
+    await insertNode({ id: 'n-p', conversation_id: 'c-seed', parent_id: null, role: 'asst', content: '' });
   });
 
-  it('insertClarify + recordClarifyResponse round-trip', async () => {
-    await insertClarify({
-      id: 'cl-1',
+  async function seedApprovalPrompt(id: string) {
+    await insertPrompt({
+      id,
       conversation_id: 'c-seed',
-      node_id: 'n-c',
-      question: 'Which?',
-      chips: [{ id: 'c-0', label: 'A' }, { id: 'c-1', label: 'B' }],
-      input_hint: 'Type more...',
+      node_id: 'n-p',
+      thread_id: 'n-p',
+      kind: 'approval',
+      tool: 'write_file',
+      payload: {
+        prompt_kind: 'approval',
+        approval: { tool: 'write_file', title: 't', body: 'b' },
+      },
     });
-    await recordClarifyResponse('cl-1', {
-      selected_chip_ids: ['c-0'],
-      text: 'extra',
+  }
+
+  it('insertPrompt + recordPromptResponse round-trip an approval', async () => {
+    await seedApprovalPrompt('pr-1');
+    expect(await recordPromptResponse('pr-1', {
+      prompt_kind: 'approval',
+      decision: 'allow',
+    })).toBe(true);
+    const row = await getPrompt('pr-1');
+    expect(row?.kind).toBe('approval');
+    expect(row?.response).toEqual({ prompt_kind: 'approval', decision: 'allow' });
+    expect(row?.respondedAt).toBeInstanceOf(Date);
+  });
+
+  it('round-trips a clarify prompt with its answer', async () => {
+    await insertPrompt({
+      id: 'pr-2',
+      conversation_id: 'c-seed',
+      node_id: 'n-p',
+      thread_id: 'n-p',
+      kind: 'clarify',
+      tool: 'ask_clarification',
+      payload: {
+        prompt_kind: 'clarify',
+        clarify: {
+          question: 'Which?',
+          chips: [{ id: 'c-0', label: 'A' }, { id: 'c-1', label: 'B' }],
+          input: 'Type more...',
+        },
+      },
     });
-    const row = await getClarify('cl-1');
+    await recordPromptResponse('pr-2', {
+      prompt_kind: 'clarify',
+      answer: { selected_chip_ids: ['c-0'], text: 'extra' },
+    });
+    const row = await getPrompt('pr-2');
+    expect(row?.payload).toMatchObject({ prompt_kind: 'clarify' });
     expect(row?.response).toEqual({
-      selected_chip_ids: ['c-0'],
-      text: 'extra',
+      prompt_kind: 'clarify',
+      answer: { selected_chip_ids: ['c-0'], text: 'extra' },
     });
+  });
+
+  it('preserves edited_args on the stored response', async () => {
+    await seedApprovalPrompt('pr-3');
+    await recordPromptResponse('pr-3', {
+      prompt_kind: 'approval',
+      decision: 'allow',
+      edited_args: { path: 'safe.txt', content: 'edited' },
+    });
+    const row = await getPrompt('pr-3');
+    expect(row?.response).toMatchObject({
+      edited_args: { path: 'safe.txt', content: 'edited' },
+    });
+  });
+
+  /**
+   * The compare-and-set is what stops two concurrent responses from both
+   * resuming the turn. A read-then-write check in the handler would let both
+   * through; this asserts the second writer is rejected at the DB.
+   */
+  it('recordPromptResponse claims once — a second response returns false', async () => {
+    await seedApprovalPrompt('pr-4');
+    const [a, b] = await Promise.all([
+      recordPromptResponse('pr-4', { prompt_kind: 'approval', decision: 'allow' }),
+      recordPromptResponse('pr-4', { prompt_kind: 'approval', decision: 'deny' }),
+    ]);
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    const row = await getPrompt('pr-4');
+    expect(row?.response).not.toBeNull();
+  });
+
+  it('listPrompts(pendingOnly) returns only unanswered prompts', async () => {
+    await seedApprovalPrompt('pr-5');
+    await seedApprovalPrompt('pr-6');
+    await recordPromptResponse('pr-5', { prompt_kind: 'approval', decision: 'allow' });
+
+    const all = await listPrompts('c-seed');
+    expect(all).toHaveLength(2);
+    const pending = await listPrompts('c-seed', true);
+    expect(pending.map((p) => p.id)).toEqual(['pr-6']);
   });
 });
 
