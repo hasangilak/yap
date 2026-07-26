@@ -52,6 +52,17 @@ function mapEvent(ev: BusEvent): TimelineEvent | null {
         sub: `${(ev.elapsed_ms / 1000).toFixed(1)}s · ${ev.status}`,
         status: ev.status === 'ok' ? 'ok' : ev.status === 'err' ? 'err' : null,
       };
+    case 'interjection.received':
+      return {
+        ...common,
+        node_id: ev.node_id,
+        kind: 'user',
+        label: truncate(ev.text, 60),
+        // Whether the model was actually cut off mid-sentence changes how to
+        // read the surrounding content, so surface it rather than hiding it.
+        sub: ev.aborted ? 'Interjected (model cut short)' : 'Interjected (queued)',
+        status: null,
+      };
     case 'prompt.responded': {
       if (ev.response.prompt_kind === 'clarify') {
         const { answer } = ev.response;

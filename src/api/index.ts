@@ -6,6 +6,7 @@ import { artifactsRouter } from './artifacts.js';
 import { conversationsRouter } from './conversations.js';
 import { devRouter } from './dev.js';
 import { exportShareRouter } from './export-share.js';
+import { interjectRouter } from './interject.js';
 import { messagesRouter } from './messages.js';
 import { nodesRouter } from './nodes.js';
 import { notesRouter } from './notes.js';
@@ -25,6 +26,7 @@ apiV1.route('/', streamRouter);
 apiV1.route('/', notesRouter);
 apiV1.route('/', timelineRouter);
 apiV1.route('/', conversationPromptsRouter);
+apiV1.route('/', interjectRouter);
 apiV1.route('/', exportShareRouter);
 apiV1.route('/search', searchRouter);
 

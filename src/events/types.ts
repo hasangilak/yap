@@ -11,6 +11,7 @@ export {
   ToolCallEndedEventSchema,
   PromptRequestedEventSchema,
   PromptRespondedEventSchema,
+  InterjectionReceivedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,

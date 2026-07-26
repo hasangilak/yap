@@ -78,3 +78,12 @@ export const SearchHitSchema = z.object({
   highlight: z.string(),
 });
 export type SearchHit = z.infer<typeof SearchHitSchema>;
+
+/**
+ * Body for `POST /conversations/:id/interject`. Text is required and
+ * non-empty — an empty interjection would abort the model round for nothing.
+ */
+export const InterjectRequestSchema = z.object({
+  text: z.string().trim().min(1),
+});
+export type InterjectRequest = z.infer<typeof InterjectRequestSchema>;

@@ -106,22 +106,23 @@ export const TurnState = new StateSchema({
   }),
 
   /**
-   * User text injected mid-turn (Phase 4 steering). Declared now so adding
-   * steering later does not reshape a schema that already has live
-   * checkpoints in Postgres.
-   */
-  interjections: new ReducedValue(z.array(z.string()), {
-    inputSchema: z.array(z.string()),
-    reducer: appendAll<string>,
-  }),
-
-  /**
    * Set by `resolvePrompt` to tell the conditional edge whether the gated
    * tool call should now run. A state field rather than a return value
    * because LangGraph routes on state, and it must survive the checkpoint
    * written between the pause and the resume.
    */
   pendingApproved: z.boolean(),
+
+  /**
+   * True when interjected text is waiting that this round did not consume —
+   * either it arrived mid-round (and aborted the model call) or it landed after
+   * the round's initial read.
+   *
+   * Without this the loop finalizes as soon as a round produces no tool calls,
+   * which is exactly what an aborted round looks like. The turn would end
+   * having accepted the user's steering and never applied it.
+   */
+  pendingSteering: z.boolean(),
 
   /** Set when the loop should stop before the round budget is spent. */
   done: z.boolean(),

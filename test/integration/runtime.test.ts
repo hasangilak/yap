@@ -12,7 +12,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
  * `AIMessageChunk.concat()` to reassemble and parse them, so faking the parsed
  * shape would test a code path that never runs in production.
  */
-const { CHAT_SCRIPTS, STREAM_CALLS } = vi.hoisted(() => ({
+const { CHAT_SCRIPTS, STREAM_CALLS, MID_STREAM } = vi.hoisted(() => ({
   CHAT_SCRIPTS: [] as Array<
     Array<{
       content?: string;
@@ -22,6 +22,14 @@ const { CHAT_SCRIPTS, STREAM_CALLS } = vi.hoisted(() => ({
     }>
   >,
   STREAM_CALLS: [] as Array<Record<string, unknown>>,
+  /**
+   * One optional hook per model round, run after the round's first chunk.
+   *
+   * This is how a test simulates something happening *while* the model is
+   * streaming — a user interjecting mid-sentence. Without it the mock stream
+   * completes atomically and the mid-round race can't be reached at all.
+   */
+  MID_STREAM: [] as Array<(() => Promise<void>) | undefined>,
 }));
 
 vi.mock('@langchain/ollama', async () => {
@@ -37,8 +45,12 @@ vi.mock('@langchain/ollama', async () => {
         ) => {
           STREAM_CALLS.push({ messages, callOpts });
           const script = CHAT_SCRIPTS.shift() ?? [];
+          const midStream = MID_STREAM.shift();
           async function* gen() {
+            let emitted = 0;
             for (const chunk of script) {
+              if (emitted === 1 && midStream) await midStream();
+              emitted++;
               if (chunk.tool_calls) {
                 yield new AIMessageChunk({
                   content: chunk.content ?? '',
@@ -84,7 +96,9 @@ import {
   getPrompt,
   insertAgent,
   insertConversation,
+  insertInterjection,
   listPrompts,
+  peekInterjections,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
 import {
@@ -116,6 +130,7 @@ async function seed() {
 beforeEach(async () => {
   CHAT_SCRIPTS.length = 0;
   STREAM_CALLS.length = 0;
+  MID_STREAM.length = 0;
   await setupCheckpointer();
   await truncateAll();
   await truncateCheckpoints();
@@ -417,6 +432,169 @@ describe('runtime — tool call flow', () => {
     const ended = second.find((e) => e.kind === 'toolcall.ended');
     expect((ended as { status: string }).status).toBe('err');
     expect((ended as { error?: string }).error).toMatch(/path|escape|outside|sandbox/i);
+  });
+});
+
+describe('runtime — mid-turn steering', () => {
+  /**
+   * The durable half of steering, end to end: text persisted while the turn is
+   * parked must reach the *next* model round.
+   *
+   * Driven through an approval pause because that is the point where the
+   * assistant node id is known and the turn is genuinely mid-flight — the same
+   * shape as a user typing while a prompt is on screen.
+   */
+  it('an interjection persisted mid-turn is injected into the next round', async () => {
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'x.txt', content: 'y' },
+            },
+          },
+        ],
+      },
+    ]);
+    CHAT_SCRIPTS.push([{ content: 'Understood, switching approach.' }]);
+
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const asstId = (
+      first.find((e) => e.kind === 'prompt.requested') as { node_id: string }
+    ).node_id;
+
+    await insertInterjection({
+      id: 'ij-test',
+      conversation_id: 'c-r',
+      node_id: asstId,
+      text: 'actually, stop and just summarise',
+    });
+
+    await drain(
+      resumeTurn({
+        conversationId: 'c-r',
+        asstNodeId: asstId,
+        resume: { prompt_kind: 'approval', decision: 'deny' },
+      }),
+    );
+
+    // The second model call must carry the steering as a user message.
+    expect(STREAM_CALLS).toHaveLength(2);
+    const secondRound = STREAM_CALLS[1]!.messages as Array<{ content: unknown }>;
+    const texts = secondRound.map((m) => String(m.content));
+    expect(texts).toContain('actually, stop and just summarise');
+
+    // Consumed only after the round completed, so it is not re-injected.
+    expect(await peekInterjections(asstId)).toHaveLength(0);
+  });
+
+  /**
+   * Regression: an interjection arriving *mid-round* must not let the turn
+   * finalize without applying it.
+   *
+   * This was a real bug found by interjecting against a live Ollama. The abort
+   * and the persistence both worked, but an aborted round produces no tool
+   * calls — which is indistinguishable from a finished round — so
+   * `afterCallModel` routed straight to `finalize`. The turn ended having
+   * accepted the user's steering and never used it (`consumed_at` stayed null).
+   * `pendingSteering` plus the `callModel` self-edge is the fix.
+   */
+  it('does not finalize while steering arrived mid-round is unapplied', async () => {
+    CHAT_SCRIPTS.push([{ content: 'Writing a long essay' }, { content: ' about canals…' }]);
+    CHAT_SCRIPTS.push([{ content: 'I was steered.' }]);
+
+    // Fires between the first and second chunk of round 1 — i.e. while the
+    // model is still streaming, which is when a real user would interject.
+    MID_STREAM.push(async () => {
+      const nodes = await getPrisma().node.findMany({
+        where: { conversationId: 'c-r', role: 'asst' },
+        select: { id: true },
+      });
+      await insertInterjection({
+        id: 'ij-mid',
+        conversation_id: 'c-r',
+        node_id: nodes[0]!.id,
+        text: 'stop, just say you were steered',
+      });
+    });
+
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'write an essay' }),
+    );
+
+    // A second round ran, and it carried the steering.
+    expect(STREAM_CALLS).toHaveLength(2);
+    const round2 = (STREAM_CALLS[1]!.messages as Array<{ content: unknown }>).map((m) =>
+      String(m.content),
+    );
+    expect(round2).toContain('stop, just say you were steered');
+
+    // The turn finalized only after applying it, and nothing is left pending.
+    expect(events.map((e) => e.kind)).toContain('node.finalized');
+    const asstId = (
+      events.find(
+        (e) => e.kind === 'node.created' && e.node.role === 'asst',
+      ) as { node: { id: string } }
+    ).node.id;
+    expect(await peekInterjections(asstId)).toHaveLength(0);
+  });
+
+  /**
+   * The self-edge added for steering must stay bounded, or a user could keep a
+   * turn alive forever by interjecting. `afterCallModel` checks the round
+   * budget before either continuation path.
+   */
+  it('stops steering rounds at the round budget', async () => {
+    for (let i = 0; i < config.maxToolRounds + 3; i++) {
+      CHAT_SCRIPTS.push([{ content: `round ${i} a` }, { content: 'b' }]);
+      // Every round gets a fresh interjection, so pendingSteering never clears.
+      MID_STREAM.push(async () => {
+        const nodes = await getPrisma().node.findMany({
+          where: { conversationId: 'c-r', role: 'asst' },
+          select: { id: true },
+        });
+        await insertInterjection({
+          id: `ij-loop-${i}`,
+          conversation_id: 'c-r',
+          node_id: nodes[0]!.id,
+          text: `steer ${i}`,
+        });
+      });
+    }
+
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'go' }),
+    );
+    expect(STREAM_CALLS.length).toBeLessThanOrEqual(config.maxToolRounds);
+    expect(events.map((e) => e.kind)).toContain('node.finalized');
+  });
+
+  /**
+   * The interjection is consumed *after* the round, so a turn that never gets
+   * another round must leave it pending rather than silently dropping it.
+   */
+  it('leaves an interjection pending when no further round runs', async () => {
+    CHAT_SCRIPTS.push([{ content: 'single round, done' }]);
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }),
+    );
+    const asstId = (
+      events.find(
+        (e) => e.kind === 'node.created' && e.node.role === 'asst',
+      ) as { node: { id: string } }
+    ).node.id;
+
+    // Arrives after the only round finished.
+    await insertInterjection({
+      id: 'ij-late',
+      conversation_id: 'c-r',
+      node_id: asstId,
+      text: 'too late for this turn',
+    });
+    expect(await peekInterjections(asstId)).toHaveLength(1);
   });
 });
 

@@ -19,6 +19,8 @@ import { TurnState } from './state.js';
 /**
  * The turn graph.
  *
+ *              ┌── steering ──┐
+ *              ▼              │
  *   prepare ─▶ callModel ─▶ gate ─▶ wait ─▶ resolvePrompt ─▶ execute
  *                  ▲          │                    │            │
  *                  │          └── auto-approved ───┴────────────┤
@@ -29,6 +31,12 @@ import { TurnState } from './state.js';
  * `gate` and `wait` are separate nodes on purpose: `wait` is the only node
  * that re-executes on resume, so all side effects live in `gate`. See
  * `nodes.ts` for the full set of rules this shape encodes.
+ *
+ * `callModel` also loops back to itself when a mid-turn interjection arrived
+ * during the round. An aborted round is indistinguishable from a finished one
+ * by tool calls alone, so that self-edge is what stops a steered turn from
+ * finalizing without ever applying the steering. `config.maxToolRounds` bounds
+ * it — see `afterCallModel`.
  */
 function build() {
   return new StateGraph(TurnState)
@@ -41,7 +49,11 @@ function build() {
     .addNode('finalize', finalizeNode)
     .addEdge(START, 'prepare')
     .addConditionalEdges('prepare', afterPrepare, ['callModel', 'finalize'])
-    .addConditionalEdges('callModel', afterCallModel, ['gate', 'finalize'])
+    .addConditionalEdges('callModel', afterCallModel, [
+      'gate',
+      'callModel',
+      'finalize',
+    ])
     .addConditionalEdges('gate', afterGate, ['wait', 'execute', 'callModel'])
     .addEdge('wait', 'resolvePrompt')
     .addConditionalEdges('resolvePrompt', afterResolve, [

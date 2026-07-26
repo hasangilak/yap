@@ -1,20 +1,20 @@
 /**
  * Process-local steering state for in-flight model calls.
  *
- * This is the one piece of turn state that is deliberately **not** durable,
- * and the distinction matters. The pause state we moved into LangGraph's
- * checkpointer had to survive a restart because a human might take minutes to
- * answer. An in-flight HTTP stream to Ollama cannot survive a restart at all —
- * the socket dies with the process — so an `AbortController` for it has no
- * meaning outside this process and nothing is lost by keeping it in memory.
+ * Exactly one thing lives here, and the boundary is deliberate: an
+ * `AbortController` for an open HTTP stream to Ollama. That socket dies with
+ * the process, so a controller for it has no meaning outside this process and
+ * nothing is lost by keeping it in memory.
  *
- * Queued interjections are held here too: they are only consumed at the next
- * round boundary, and if the process dies before that the turn is recovered
- * from its checkpoint and the user can simply say it again.
+ * The interjected **text** is not here — it is a row in the `interjections`
+ * table. The endpoint returns 200 once that row exists, so the user has been
+ * told we accepted their input; keeping it in a `Map` would let a restart
+ * discard it silently, which is the same class of bug as the clarify answer
+ * that used to be dropped when no runtime was listening. Durable user input,
+ * ephemeral socket handle.
  */
 
 const controllers = new Map<string, AbortController>();
-const queued = new Map<string, string[]>();
 
 /**
  * Fresh controller for a model round, replacing any stale one for this thread.
@@ -27,7 +27,14 @@ export function takeAbortController(threadId: string): AbortController {
   return ac;
 }
 
-/** Abort the in-flight model round, if this process owns one. */
+/**
+ * Abort the in-flight model round, if this process owns one.
+ *
+ * Returns false when there is nothing to abort — the turn is paused on a
+ * prompt, between rounds, or running in another process. That is not a
+ * failure: the interjection row is already persisted and the next round picks
+ * it up. Callers surface this as `aborted`, not as an error.
+ */
 export function abortActiveRound(threadId: string): boolean {
   const ac = controllers.get(threadId);
   if (!ac || ac.signal.aborted) return false;
@@ -37,24 +44,4 @@ export function abortActiveRound(threadId: string): boolean {
 
 export function clearAbortController(threadId: string): void {
   controllers.delete(threadId);
-}
-
-/** Queue user text to be injected before the next model round. */
-export function queueInterjection(threadId: string, text: string): void {
-  const list = queued.get(threadId) ?? [];
-  list.push(text);
-  queued.set(threadId, list);
-}
-
-/** Drain queued interjections for a thread. */
-export function getInterjections(threadId: string): string[] {
-  const list = queued.get(threadId) ?? [];
-  queued.delete(threadId);
-  return list;
-}
-
-/** Release both maps for a finished turn. */
-export function clearSteering(threadId: string): void {
-  controllers.delete(threadId);
-  queued.delete(threadId);
 }

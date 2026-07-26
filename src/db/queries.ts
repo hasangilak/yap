@@ -1104,6 +1104,73 @@ export async function rippleCounts(
   return { descendant_count: ids.length, tool_calls_to_replay: tools, approvals_required: approvals };
 }
 
+// -- interjections (mid-turn steering) ----------------------------------------
+
+export async function insertInterjection(input: {
+  id: string;
+  conversation_id: string;
+  node_id: string;
+  text: string;
+}): Promise<void> {
+  await getPrisma().interjection.create({
+    data: {
+      id: input.id,
+      conversationId: input.conversation_id,
+      nodeId: input.node_id,
+      text: input.text,
+    },
+  });
+}
+
+/**
+ * Unconsumed interjections for a thread, oldest first. Read-only — the caller
+ * marks them consumed with `consumeInterjections` **after** the round that used
+ * them finishes.
+ *
+ * Split into peek/consume rather than a single draining call so delivery is
+ * at-least-once: if the process dies mid-round the rows stay pending and the
+ * text is re-injected on replay. Consuming up front would make a crash silently
+ * swallow what the user typed, which is the failure mode this whole feature is
+ * supposed to avoid.
+ */
+export async function peekInterjections(
+  nodeId: string,
+): Promise<{ id: string; text: string }[]> {
+  return getPrisma().interjection.findMany({
+    where: { nodeId, consumedAt: null },
+    select: { id: true, text: true },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+/** Mark specific interjections consumed. Ids are explicit so anything inserted
+ * mid-round stays pending for the next one. */
+export async function consumeInterjections(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await getPrisma().interjection.updateMany({
+    where: { id: { in: ids } },
+    data: { consumedAt: new Date() },
+  });
+}
+
+/**
+ * The assistant node currently mid-turn for a conversation, if any.
+ *
+ * `streaming: true` is the marker, and it doubles as the graph `thread_id`, so
+ * this is how an interject request finds the turn to steer. Returns null when
+ * nothing is running — which the endpoint reports rather than queueing text
+ * against a turn that will never read it.
+ */
+export async function findActiveAssistantNode(
+  conversationId: string,
+): Promise<{ id: string } | null> {
+  return getPrisma().node.findFirst({
+    where: { conversationId, role: 'asst', streaming: true },
+    select: { id: true },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
 // -- approval grants ----------------------------------------------------------
 
 const LOCAL_USER = 'local';

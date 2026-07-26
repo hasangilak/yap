@@ -8,7 +8,7 @@ import {
 } from '../db/queries.js';
 import { envelope } from './graph/emit.js';
 import { getTurnGraph, turnConfig } from './graph/index.js';
-import { clearSteering } from './graph/steering.js';
+import { clearAbortController } from './graph/steering.js';
 import type { BusEvent } from '../events/types.js';
 import type { MessageNode } from '../schemas/index.js';
 
@@ -159,8 +159,8 @@ export async function* runAssistantTurn(input: {
     openPrompts: [],
     promptResponses: {},
     resolvedToolCalls: [],
-    interjections: [],
     pendingApproved: false,
+    pendingSteering: false,
     done: false,
   };
 
@@ -202,5 +202,5 @@ export async function* continueTurn(input: {
 
 /** Release process-local steering state for a finished turn. */
 export function releaseTurn(asstNodeId: string): void {
-  clearSteering(asstNodeId);
+  clearAbortController(asstNodeId);
 }

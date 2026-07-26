@@ -191,6 +191,14 @@ describe('schemas — BusEvent discriminated union', () => {
       },
       {
         ...base,
+        kind: 'interjection.received',
+        node_id: 'n',
+        interjection_id: 'ij-1',
+        text: 'actually, use TypeScript',
+        aborted: true,
+      },
+      {
+        ...base,
         kind: 'artifact.updated',
         artifact_id: 'art',
         version_id: 'av',

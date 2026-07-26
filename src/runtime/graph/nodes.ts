@@ -5,10 +5,12 @@ import {
   getAgentPermission,
   getAgentRaw,
   getConversationRaw,
+  consumeInterjections,
   hasGrant,
   insertGrant,
   insertNode,
   insertPrompt,
+  peekInterjections,
   recordArtifactWrite,
   recordPromptResponse,
   updateConversationPointers,
@@ -30,7 +32,7 @@ import { DEFAULT_SYSTEM_PROMPT } from '../../system-prompt.js';
 import { envelope, makeEmit } from './emit.js';
 import { streamModelRound } from './model.js';
 import type { NormalizedToolCall, OpenPrompt, TurnStateValue } from './state.js';
-import { getInterjections, takeAbortController } from './steering.js';
+import { takeAbortController } from './steering.js';
 
 /**
  * The turn graph's nodes.
@@ -173,9 +175,15 @@ export async function callModelNode(
   const emit = makeEmit(cfg);
   const { conversationId, asstNodeId, runStartedAt } = state;
 
-  // Any text the user injected mid-turn goes in before this round runs.
-  const pending = getInterjections(asstNodeId);
-  const injected = pending.map((text) => ({ role: 'user' as const, content: text }));
+  // Any text the user pushed in mid-turn goes in before this round runs.
+  // Peeked, not drained: these are only marked consumed once the round below
+  // has finished streaming, so a crash mid-round re-injects rather than
+  // silently swallowing what the user typed.
+  const pending = await peekInterjections(asstNodeId);
+  const injected = pending.map((row) => ({
+    role: 'user' as const,
+    content: row.text,
+  }));
 
   const ac = takeAbortController(asstNodeId);
   const result = await streamModelRound({
@@ -210,6 +218,17 @@ export async function callModelNode(
       // module tracks; emitted below once the round settles.
     },
   });
+
+  // The round is over, so the steering text it carried has been delivered.
+  // Deliberately after `streamModelRound`, not before it.
+  await consumeInterjections(pending.map((row) => row.id));
+
+  // Re-read: anything that arrived *during* the round is still pending, which
+  // includes the interjection that aborted this round in the first place (it was
+  // inserted after the peek above). The flag is what keeps the loop going —
+  // an aborted round has no tool calls, so without it the turn would finalize
+  // having accepted the user's steering and never used it.
+  const stillPending = await peekInterjections(asstNodeId);
 
   for (const [i, text] of result.reasoningSteps.entries()) {
     emit({
@@ -269,8 +288,8 @@ export async function callModelNode(
     accumulatedContent,
     reasoningSteps: result.reasoningSteps,
     messages: [...injected, assistantMessage],
-    interjections: [],
     pendingToolCalls: result.toolCalls,
+    pendingSteering: stillPending.length > 0,
     round: state.round + 1,
     done: false,
   };
@@ -657,13 +676,23 @@ export function afterPrepare(state: TurnStateValue): 'callModel' | 'finalize' {
   return state.done ? 'finalize' : 'callModel';
 }
 
+/**
+ * The round budget is checked **first** so it bounds both continuation paths.
+ * Tool calls loop through `gate`; steering loops straight back to `callModel`,
+ * and that self-loop needs the same ceiling or a user could keep a turn alive
+ * indefinitely by interjecting.
+ */
 export function afterCallModel(
   state: TurnStateValue,
-): 'gate' | 'finalize' {
+): 'gate' | 'callModel' | 'finalize' {
   if (state.done) return 'finalize';
-  if (state.pendingToolCalls.length === 0) return 'finalize';
   if (state.round >= config.maxToolRounds) return 'finalize';
-  return 'gate';
+  if (state.pendingToolCalls.length > 0) return 'gate';
+  // No tool calls, but the user steered mid-round. An aborted round looks
+  // exactly like a finished one from here, so without this the turn would end
+  // having accepted the steering and never applied it.
+  if (state.pendingSteering) return 'callModel';
+  return 'finalize';
 }
 
 export function afterGate(state: TurnStateValue): 'wait' | 'execute' | 'callModel' {

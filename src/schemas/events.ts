@@ -153,6 +153,22 @@ export const PromptRespondedEventSchema = Base.extend({
   response: PromptResponseSchema,
 });
 
+/**
+ * User text pushed into a turn that is already running.
+ *
+ * Emitted when the row is persisted, not when the model consumes it — the
+ * client needs a transcript record immediately, and the two can be separated by
+ * a whole round. `aborted` says whether an in-flight model call was actually
+ * cut short: false means the text is queued for the next round instead.
+ */
+export const InterjectionReceivedEventSchema = Base.extend({
+  kind: z.literal('interjection.received'),
+  node_id: z.string(),
+  interjection_id: z.string(),
+  text: z.string(),
+  aborted: z.boolean(),
+});
+
 export const ArtifactUpdatedEventSchema = Base.extend({
   kind: z.literal('artifact.updated'),
   artifact_id: z.string(),
@@ -179,6 +195,7 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ToolCallEndedEventSchema,
   PromptRequestedEventSchema,
   PromptRespondedEventSchema,
+  InterjectionReceivedEventSchema,
   ArtifactUpdatedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
