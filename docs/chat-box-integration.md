@@ -19,156 +19,298 @@ a single fetch.**
 - Base URL is `http://localhost:3001/api/v1` (configurable).
 - Optional bearer-token auth gate: set `YAP_API_TOKEN` on the server →
   every request must carry `Authorization: Bearer <token>`.
-- All mutating POSTs (including `POST /messages`, approvals, agent
+- All mutating POSTs (including `POST /messages`, prompt responses, agent
   PATCH, etc.) accept an `Idempotency-Key` header; the server
   de-duplicates retries for 24h.
 - A shared Postgres DB is the durable state of record. Every BusEvent
   is persisted before publication, so `GET /stream?since_event=<id>`
   always replays a clean tail after reconnect.
-- **Pauses for human input are now durable** (see §0.5). An approval or
-  clarification can be answered minutes later, or after a server
-  restart, and the turn still resumes.
+- **⚠️ BREAKING: approvals and clarifications are now one "prompt"
+  concept** — `prompt.requested` / `prompt.responded` and a single
+  `POST /prompts/:id/respond`. Four event kinds and two endpoints are
+  gone. **Start at §0.5**, which has the migration checklist.
+- **Pauses for human input are durable.** A prompt can be answered
+  minutes later, or after a server restart, and the turn still resumes.
+  Users can also **edit a proposed tool call's arguments** before
+  approving it.
 
 ---
 
-## 0.5 Runtime change: durable human-in-the-loop
+## 0.5 BREAKING: durable prompts replace approvals + clarifications
 
-The turn runtime is now a **LangGraph state graph checkpointed to
-Postgres**. This section is the whole story for a client: what actually
-changed on the wire, what didn't, and what is coming.
+Two changes shipped together. The first is invisible to you; the second
+requires code changes in chat-box.
 
-### 0.5.1 What this fixes
+1. The turn runtime is a **LangGraph state graph checkpointed to
+   Postgres**, so a pause for human input survives a server restart.
+2. **Approvals and clarifications are now one thing: a *prompt*.** One
+   table, one event pair, one endpoint. This breaks the wire.
 
-Previously a paused turn lived in an **in-process promise**. If the
-server restarted while an approval was on screen, the turn was gone
-forever: the `approvals` row stayed undecided, the assistant node stayed
-`streaming: true`, and nothing ever revisited it. The user's only signal
-was a card that never resolved and a spinner that never stopped.
+Read §0.5.3 for the migration checklist. Everything in this section is
+verified against a running server, not inferred from the code.
 
-Now the pause is a checkpoint row. A decision resumes the turn from any
-request, in any process, at any later time.
+### 0.5.1 Why the collapse
 
-### 0.5.2 Breaking changes, shipped
+An approval and a clarification were always the same mechanic — persist a
+row, pause the turn, resume when a human answers. They were separate only
+because they were built in different phases. Keeping them separate meant
+two endpoints, four event kinds, two DB tables and two client code paths
+for one concept, and every new capability (editable args, several open at
+once, steering) had to be built twice.
 
-**For chat-box specifically: none.** We checked
-`src/api/approvals.ts`, `src/api/clarify.ts` and
-`src/state/threadReducer.ts` against this change — every event kind and
-payload is byte-identical, and the two response fields that changed are
-fields chat-box does not read. No code change is *required* to keep
-working. There is one behaviour change worth adopting, in §0.5.4.
+They are now one `prompt` with a `prompt_kind` discriminator.
 
-For any other client, the full list:
+The durability half fixes a worse problem: a paused turn used to live in
+an **in-process promise**. A restart while an approval was on screen
+destroyed the turn permanently — the row stayed undecided, the node
+stayed `streaming: true`, and nothing ever revisited it. The user saw a
+card that never resolved and a spinner that never stopped. Now a decision
+resumes the turn from any request, in any process, at any later time.
 
-| # | Change | Impact |
+### 0.5.2 The full breaking list
+
+**Events** — four kinds become two:
+
+| Removed | Replaced by |
+|---|---|
+| `approval.requested` | `prompt.requested` with `request.prompt_kind: 'approval'` |
+| `clarify.requested` | `prompt.requested` with `request.prompt_kind: 'clarify'` |
+| `approval.decided` | `prompt.responded` with `response.prompt_kind: 'approval'` |
+| `clarify.answered` | `prompt.responded` with `response.prompt_kind: 'clarify'` |
+
+```jsonc
+// prompt.requested — approval
+{
+  "kind": "prompt.requested",
+  "id": "f9742f26-…", "at": 1785100735157, "conversation_id": "c-dd3cb1ee",
+  "node_id": "n-0cc9eace",
+  "prompt_id": "pr-f015ff0b",
+  "tool": "write_file",
+  "request": {
+    "prompt_kind": "approval",
+    "approval": { "tool": "write_file", "title": "Run write_file",
+                  "body": "Write or edit a file. Requires approval.",
+                  "preview": "{\"content\":\"original text\",\"path\":\"draft.txt\"}" }
+  }
+}
+
+// prompt.requested — clarify
+{
+  "kind": "prompt.requested", "node_id": "n-e5348474",
+  "prompt_id": "pr-0e3ac2cb", "tool": "ask_clarification",
+  "request": {
+    "prompt_kind": "clarify",
+    "clarify": { "question": "Which format do you prefer for the summary?",
+                 "chips": [ { "id": "c-0", "label": "Bullet points" },
+                            { "id": "c-1", "label": "Paragraph" } ],
+                 "input": "" }
+  }
+}
+
+// prompt.responded — approval, with the user's edit
+{
+  "kind": "prompt.responded", "node_id": "n-0cc9eace",
+  "prompt_id": "pr-f015ff0b", "tool": "write_file",
+  "response": {
+    "prompt_kind": "approval",
+    "decision": "allow",
+    "edited_args": { "path": "edited-by-human.txt", "content": "the human rewrote this" }
+  }
+}
+
+// prompt.responded — clarify
+{
+  "kind": "prompt.responded", "node_id": "n-e5348474",
+  "prompt_id": "pr-0e3ac2cb", "tool": "ask_clarification",
+  "response": {
+    "prompt_kind": "clarify",
+    "answer": { "selected_chip_ids": ["c-0"], "text": "bullets, five max" }
+  }
+}
+```
+
+The kind-specific data is **nested** under `request` / `response` rather
+than sitting as sibling optional fields. That is deliberate: it narrows
+in TypeScript (`ev.request.prompt_kind === 'approval'` proves
+`ev.request.approval` exists) and it makes a mismatched pair fail
+validation instead of parsing into a half-populated object.
+
+**Endpoints** — two become one:
+
+| Removed (now 404) | Replaced by |
+|---|---|
+| `POST /approvals/:id/decide` | `POST /prompts/:id/respond` |
+| `POST /clarify/:id/answer` | `POST /prompts/:id/respond` |
+
+`GET /approvals/grants` and `DELETE /approvals/grants/:key` are
+**unchanged** — a grant is a standing permission keyed by (agent, tool),
+not a per-pause record, so it outlives the turn and kept its own routes.
+
+**New endpoints:**
+
+| Method | Path | Purpose |
 |---|---|---|
-| 1 | `POST /approvals/:id/decide` response: `runtime_awake` → `resumed` | Breaks a client that read `runtime_awake`. chat-box types this as `{ok, decision}` and ignores it. |
-| 2 | `POST /clarify/:id/answer` response: `runtime_awake` → `resumed` | Same. chat-box types this as `{ok}`. |
-| 3 | `approval.decided` / `clarify.answered` now arrive **after** the HTTP 200, emitted by the graph | Breaks a client that assumed the event was already published when `decide()` resolved. chat-box's reducer treats both as no-ops, so it is unaffected. |
+| `GET` | `/prompts/:id` | One prompt with its request and response state |
+| `GET` | `/conversations/:id/prompts?pending=true` | Every open prompt, newest first |
 
-`resumed: false` is not an error. It means there was no paused turn to
-continue — a turn whose checkpoint predates this feature, or one already
-finished. The decision is still persisted and the event still published.
+**Ids:** prompt ids are `pr-<8 hex>`. The old `ap-…` and `cl-…` prefixes
+are gone.
 
-**No event kinds were added, removed, or renamed.** All 16 keep their
-exact payloads. `since_event` replay semantics are unchanged.
+**Response-field renames from the durability work** (these would have
+broken a client that read them; chat-box did not):
+`runtime_awake` → `resumed` on both former endpoints.
 
-### 0.5.3 One new message you may see
+### 0.5.3 chat-box migration checklist
+
+Concrete, against the files we read in your repo:
+
+- [ ] **`src/api/approvals.ts`** — replace `decideApproval(id, decision)`
+      with `respondToPrompt(id, body)` hitting
+      `POST /prompts/:id/respond`. Keep the grants functions as they are.
+- [ ] **`src/api/clarify.ts`** — delete; it becomes the same call with a
+      different body.
+- [ ] **`src/state/threadReducer.ts`** — the `approval.decided` (line
+      153) and `clarify.answered` (line 166) no-op cases become one
+      `prompt.responded` case, and `approval.requested` /
+      `clarify.requested` become one `prompt.requested`. **Do not leave
+      `prompt.responded` a no-op** — see the reload bug below.
+- [ ] **`ApprovalCard.tsx`** — stop holding decided state in
+      `useState`. Drive it from the reducer, and treat `409` as settled.
+- [ ] **Key prompt UI by `prompt_id`**, not by "the turn's one
+      approval". Several prompts will be open at once.
+- [ ] **Add an `edited_args` affordance** — the user can now rewrite a
+      proposed tool call's arguments before allowing it.
+
+**The reload bug this fixes.** `ApprovalCard` currently does:
+
+```tsx
+const [decision, setDecision] = useState<Decision | null>(null);
+await decideApproval(approval.id, d);
+setDecision(d);
+```
+
+That was survivable when a pause could not outlive the page. Now a pause
+outlives both the page and the server, so on reload the card rebuilds
+from the request event — which nothing clears — and renders **live
+buttons for an already-answered prompt**. Clicking returns `409`. Handle
+`prompt.responded` in the reducer and the problem disappears, including
+across tabs.
+
+**Or skip replay entirely.** New in this change:
+`GET /conversations/:id/prompts?pending=true` returns exactly what the
+conversation is waiting on. Previously a client could *only* learn this by
+replaying the event log — the node row is no help, because `node.approval`
+is never written by the runtime at all and `node.clarify` is only filled in
+*after* the answer (see the caveat in §5.2). One request on mount now
+rebuilds every open prompt.
+
+### 0.5.4 `edited_args` — what it means for the UI
+
+An approval response may carry `edited_args`, and if it does, **the tool
+ran with those arguments, not the ones the model proposed**. Anything
+rendering history from the event stream must show the edited values or it
+misreports what happened. `toolcall.started` also carries the edited args,
+so the two agree.
+
+Verified end-to-end: the model proposed `draft.txt`, the user submitted
+`edited-by-human.txt`, the tool wrote `edited-by-human.txt`, and
+`draft.txt` was never created.
+
+Two things to know:
+
+- `edited_args` is **dropped when `decision` is `deny`** — a denial has
+  nothing to edit, and storing args would imply the call ran.
+- Editing is **not** a way around tool restrictions. `write_file` is
+  sandboxed at *execution* time, so an edited path escapes nothing; a
+  `../../escaped.txt` edit comes back as `toolcall.ended` with
+  `status: 'err'`. Feel free to let users edit freely — the server is the
+  one enforcing.
+
+### 0.5.5 `POST /prompts/:id/respond`
+
+Body depends on the prompt's kind — **you do not restate the kind**, the
+server reads it from the stored row:
+
+```jsonc
+// kind: 'approval'
+{ "decision": "allow" | "always" | "deny",
+  "edited_args": { … }?  }          // optional; ignored on deny
+
+// kind: 'clarify'
+{ "selected_chip_ids": ["c-0"],     // optional, defaults []
+  "text": "bullets, five max" }     // optional, defaults ""
+```
+
+Responses:
+
+```jsonc
+200 { "ok": true, "prompt_id": "pr-f015ff0b", "kind": "approval", "resumed": true }
+200 { "ok": true, "prompt_id": "pr-f015ff0b", "kind": "approval", "resumed": false }
+400 { "error": "invalid body for an approval prompt", "expected": {…}, "issues": [...] }
+404 { "error": "not found" }
+409 { "error": "already responded", "response": { "prompt_kind": "approval", "decision": "allow", … } }
+```
+
+- **`resumed: false` is not an error.** It means there was no paused turn
+  to continue — already finished, or a checkpoint that predates the graph
+  runtime. The response is still recorded and the event still published.
+- **`409` carries the winning response.** Render it instead of an error;
+  the prompt is settled, just not by this click.
+- **`400` means the body did not match the prompt's kind** — e.g. a
+  clarify answer sent to an approval prompt. `issues` is the raw Zod
+  issue list. (Note: this endpoint returns a proper 400; most other
+  endpoints in this API still return 500 on a malformed body. That is a
+  known wart, not a contract.)
+
+Concurrency is safe: the response write is a compare-and-set, so two
+simultaneous responses resolve to exactly one `200` and one `409`, never
+two resumes.
+
+### 0.5.6 One new message you may see
 
 Boot recovery reconciles turns that were mid-flight when the server
-stopped. A turn with no usable checkpoint now gets a terminal `error`:
+stopped. A turn with no usable checkpoint gets a terminal `error`:
 
 ```
 turn was interrupted by a server restart and cannot be resumed
 ```
 
-This is an existing kind (`error`), so chat-box already routes it to
-`lastError`. It is worth special-casing in the UI: it is not a model
-failure, and the right affordance is "regenerate", not "retry request".
-Turns that *were* recoverable produce no such event — they simply
-continue.
+This is an existing kind (`error`), so it already routes to `lastError`.
+Worth special-casing: it is not a model failure, and the right affordance
+is "regenerate", not "retry request". Recoverable turns produce no such
+event — they just continue.
 
-### 0.5.4 The one thing chat-box should change
+One caveat you will hit in dev: `POST /dev/seed` inserts a fixture node
+with `streaming: true` and no checkpoint, so **the first restart after a
+seed emits one of these errors for `c-01`**. It is an artifact of the
+fixture, not a real stranded turn.
 
-`ApprovalCard` tracks its decided state in local component state:
-
-```tsx
-const [decision, setDecision] = useState<Decision | null>(null);
-// ...
-await decideApproval(approval.id, d);
-setDecision(d);
-```
-
-That was survivable when a pause could not outlive the page. It is now
-the weakest part of the flow, because a pause can outlive both the page
-and the server. On reload or reconnect the card rebuilds from
-`node.approval` — which `approval.requested` set and nothing clears — so
-an **already-decided approval renders with live buttons again**. Clicking
-returns `409 already decided`, which the card surfaces as a red error.
-
-The fix is to derive decided-state from the server rather than from a
-click. Options, cheapest first:
-
-1. Handle `approval.decided` in `threadReducer` (currently a no-op) by
-   patching the decision onto the node, and drive the card from that.
-   Because replay is authoritative, a full reconnect then reconstructs
-   decided-state for free, and a decision made in one open tab shows up
-   in another.
-2. Treat `409 already decided` as success — the response body carries
-   `{ error, decision }`, so the card can render the real outcome instead
-   of a red error.
-
-Do both; (1) is the substantive fix and (2) is the cheap backstop.
-
-**Important limitation to know before you design this.** The server does
-**not** persist approval state onto the node row. `Node.approval` exists
-in the schema and `insertNode` accepts it, but nothing in the turn
-runtime ever writes it — `updateNode` has no `approval` field at all. So
-the *only* source of truth for a client is the event stream:
-`approval.requested` and `approval.decided`.
-
-That means reconstructing a pending or decided approval requires
-**replaying events** (`GET /stream` with no `since_event`, or from a
-cursor that precedes the request). Fetching the node tree via
-`GET /conversations/:id` alone will not tell you an approval exists.
-chat-box already does the right thing here by building `node.approval` in
-the reducer from the event — just don't switch to a tree-only load and
-expect approvals to survive it.
-
-If you'd rather not depend on replay, say so: denormalizing the decision
-onto the node is a small server change and a reasonable thing to ask for.
-
-### 0.5.5 Behaviour that is now genuinely different
+### 0.5.7 Behaviour that is now genuinely different
 
 - **A pause has no timeout.** It survives indefinitely. Don't build UI
-  that assumes a pending approval is fresh — show when it was requested.
+  that assumes a pending prompt is fresh — show when it was requested
+  (`created_at` on the prompt row).
 - **Reconnect mid-pause works.** `?since_event=<id>` replays the turn up
-  to the pause and then sits live, waiting. Verified end-to-end across a
-  `SIGKILL`.
-- **Turns outlive the request that started them.** Already true, now
-  more visible: `POST /messages` returns once the user node exists, and
+  to the pause and then sits live. Verified across a `SIGKILL`: no gaps,
+  no duplicates.
+- **`prompt.responded` arrives after the HTTP 200**, emitted by the graph
+  so it stays ordered with the rest of the turn. Don't treat the HTTP
+  response as the signal that the event has been published.
+- **Turns outlive the request that started them.** Already true, now more
+  visible: `POST /messages` returns once the user node exists, and
   everything after arrives on the stream.
 
-### 0.5.6 Coming next — this *will* break the wire
+### 0.5.8 Still coming
 
-Planned and agreed, not yet shipped. Do not build against it yet, but
-know it is coming so you don't invest in shapes that are about to move:
+Not shipped, not yet breaking:
 
-- `approval.requested` / `approval.decided` / `clarify.requested` /
-  `clarify.answered` **collapse into `prompt.requested` /
-  `prompt.responded`**, with `kind: 'approval' | 'clarify'` inside.
-- `POST /approvals/:id/decide` and `POST /clarify/:id/answer` **collapse
-  into `POST /prompts/:id/respond`**.
-- Responses gain **`edited_args`**: the user will be able to modify a
-  proposed tool call's arguments before allowing it, not just
-  allow/deny.
-- **Several prompts can be open at once**, answerable in any order, so
-  prompt UI should not assume a single pending item per turn.
-- New `POST /conversations/:id/interject` to steer a turn mid-flight
-  without cancelling it.
-
-That set ships as one breaking change with chat-box updated in lockstep.
-The most useful thing you can do now is keep prompt rendering keyed by
-prompt id rather than by "the turn's one approval".
+- **Several prompts open at once**, answerable in any order. The wire is
+  already shaped for it (`prompt_id`-keyed, `?pending=true` returns a
+  list) — the runtime still gates one tool call at a time, so today you
+  will only ever see one open. Build for the list anyway.
+- **`POST /conversations/:id/interject`** to steer a turn mid-flight
+  without cancelling it. The runtime plumbing exists; the endpoint does
+  not.
 
 ---
 
@@ -220,14 +362,15 @@ an approval model, and writes artifacts to a sandboxed directory.
 │ fetch stream     │◀── SSE events ──────│  prepare → callModel     │
 │ /stream          │                     │  gate → wait(pause!)     │
 │                  │                     │  execute → finalize      │
-│ POST /decide ────┼── resume ──────────▶│                          │
+│ POST /prompts/   │                     │                          │
+│   :id/respond ───┼── resume ──────────▶│                          │
 └──────────────────┘                     └───────────┬──────────────┘
                                                      │
                                                      ▼
                                        ┌──────────────────────────┐
                                        │ Postgres                 │
                                        │  public: nodes, events,  │
-                                       │    approvals, …          │
+                                       │    prompts, …            │
                                        │  langgraph: checkpoints  │
                                        └──────────────────────────┘
 ```
@@ -239,9 +382,9 @@ an approval model, and writes artifacts to a sandboxed directory.
   client. The stream follows the **conversation**, not whoever is
   producing — so it keeps working when a turn resumes in a later
   request or a different process.
-- On approval/clarify the graph **checkpoints and stops**. A `POST` from
-  the client resumes it from that checkpoint. This is the part that used
-  to be an in-process promise; see §0.5.
+- When a prompt is raised the graph **checkpoints and stops**. A
+  `POST /prompts/:id/respond` resumes it from that checkpoint. This is the
+  part that used to be an in-process promise; see §0.5.
 - Every mutation is durable in Postgres; reconnects replay from the
   `events` table.
 
@@ -426,44 +569,51 @@ interface PatchAgentResponse {
 |---|---|---|
 | `GET` | `/tools` | Static registry — `ToolDef[]` (the 7 client-shaped defs) |
 
-### 3.5 Approvals
+### 3.5 Prompts (approvals + clarifications)
+
+Every pause awaiting a human is a *prompt*. See §0.5 for the full
+breaking-change story and body shapes.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/approvals/:id/decide` | `{ decision: 'allow' \| 'always' \| 'deny' }` — resume the paused turn |
+| `POST` | `/prompts/:id/respond` | Answer a prompt and resume the paused turn |
+| `GET` | `/prompts/:id` | One prompt: request payload + response state |
+| `GET` | `/conversations/:id/prompts` | All prompts for a conversation, newest first |
+| `GET` | `/conversations/:id/prompts?pending=true` | Only the unanswered ones |
+
+`PromptRow` wire shape:
+
+```jsonc
+{
+  "id": "pr-f015ff0b",
+  "conversation_id": "c-dd3cb1ee",
+  "node_id": "n-0cc9eace",
+  "kind": "approval",              // 'approval' | 'clarify'
+  "tool": "write_file",            // 'ask_clarification' for clarify prompts
+  "request":  { "prompt_kind": "approval", "approval": { … } },
+  "response": null,                // PromptResponse once answered
+  "responded_at": null,
+  "created_at": "2026-07-26T21:18:55.154Z"
+}
+```
+
+The response is persisted **before** the turn is resumed, so an answer is
+never lost to a failure in between — and the write is a compare-and-set,
+so concurrent responses cannot both resume the turn.
+
+`GET /conversations/:id/prompts?pending=true` is the reconnect path: one
+request rebuilds every open prompt. Prefer it to replaying events.
+
+### 3.6 Grants
+
+| Method | Path | Purpose |
+|---|---|---|
 | `GET` | `/approvals/grants` | List active `"allow always"` grants |
 | `DELETE` | `/approvals/grants/:key` | Revoke a grant; `key = tool:<tool>:agent:<agent_id>` |
 
-`POST /approvals/:id/decide` responses:
-
-```jsonc
-200 { "ok": true, "decision": "allow", "resumed": true }   // turn continued
-200 { "ok": true, "decision": "allow", "resumed": false }  // nothing to resume; still recorded
-404 { "error": "not found" }
-409 { "error": "already decided", "decision": "allow" }    // carries the real outcome
-```
-
-The decision is persisted **before** the turn is resumed, so an answer is
-never lost to a failure in between. `resumed` replaces the old
-`runtime_awake` field (§0.5.2). Treat `409` as "already settled" and
-render `decision` rather than showing an error — see §0.5.4.
-
-### 3.6 Clarifications
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/clarify/:id/answer` | `{ selected_chip_ids: string[], text: string }` — resume the paused turn |
-
-```jsonc
-200 { "ok": true, "resumed": true }
-404 { "error": "not found" }
-409 { "error": "already answered" }
-```
-
-This endpoint previously did **not** persist the answer — it published
-the event and woke an in-process promise, leaving the DB write to the
-runtime afterwards, so with no runtime listening the answer was silently
-dropped. It now persists first, matching the approval path.
+Unchanged by the prompt collapse. A grant is a standing permission keyed
+by (agent, tool) — it outlives the turn that created it, which is why it
+kept its own routes. Responding `always` to an approval prompt writes one.
 
 ### 3.7 Artifacts
 
@@ -664,32 +814,37 @@ interface ToolCallEndedEvent extends BaseEvent {
   error?: string;
 }
 
-interface ApprovalRequestedEvent extends BaseEvent {
-  kind: 'approval.requested';
+// The nested unions below are what make a mismatched pair — say
+// prompt_kind 'approval' carrying clarify data — fail validation rather
+// than parse into a half-populated object. They also narrow: checking
+// prompt_kind proves which sibling field is present.
+
+type PromptRequest =
+  | { prompt_kind: 'approval'; approval: ApprovalData }   // { tool, title, body, preview? }
+  | { prompt_kind: 'clarify';  clarify:  ClarifyData };   // { question, chips, input }
+
+type PromptResponse =
+  | { prompt_kind: 'approval';
+      decision: 'allow' | 'always' | 'deny';
+      /** Present only if the user rewrote the args. The tool ran with THESE. */
+      edited_args?: Record<string, unknown>; }
+  | { prompt_kind: 'clarify';
+      answer: { selected_chip_ids: string[]; text: string }; };
+
+interface PromptRequestedEvent extends BaseEvent {
+  kind: 'prompt.requested';
   node_id: string;
-  approval_id: string;        // POST this id back to /approvals/:id/decide
-  approval: ApprovalData;     // { tool, title, body, preview? }
+  prompt_id: string;          // POST this id back to /prompts/:id/respond
+  tool: string;               // 'ask_clarification' for clarify prompts
+  request: PromptRequest;
 }
 
-interface ApprovalDecidedEvent extends BaseEvent {
-  kind: 'approval.decided';
+interface PromptRespondedEvent extends BaseEvent {
+  kind: 'prompt.responded';
   node_id: string;
-  approval_id: string;
-  decision: 'allow' | 'always' | 'deny';
-}
-
-interface ClarifyRequestedEvent extends BaseEvent {
-  kind: 'clarify.requested';
-  node_id: string;
-  clarify_id: string;
-  clarify: ClarifyData;       // { question, chips, input }
-}
-
-interface ClarifyAnsweredEvent extends BaseEvent {
-  kind: 'clarify.answered';
-  node_id: string;
-  clarify_id: string;
-  response: { selected_chip_ids: string[]; text: string };
+  prompt_id: string;
+  tool: string;
+  response: PromptResponse;
 }
 
 interface ArtifactUpdatedEvent extends BaseEvent {
@@ -755,12 +910,14 @@ active_leaf.changed
 ```
 ...                   (same prefix)
 toolcall.proposed
-approval.requested    ← pause the assistant and render ApprovalCard
+prompt.requested      ← request.prompt_kind='approval'; render ApprovalCard
 status.update(approval)
-— client POSTs /approvals/:id/decide —
-approval.decided(allow|always|deny)
+  ⏸  the turn is now parked in Postgres. It survives a restart.
+      Nothing arrives until a human answers — there is no timeout.
+— client POSTs /prompts/:id/respond {decision} —
+prompt.responded      ← response.prompt_kind='approval'
 # if allow|always:
-toolcall.started
+toolcall.started      ← args = edited_args if the user rewrote them
 status.update(tool)
 toolcall.ended(ok)
 artifact.updated      ← for write_file specifically
@@ -779,14 +936,19 @@ active_leaf.changed
 ```
 ...                   (same prefix)
 toolcall.proposed(ask_clarification)
-clarify.requested     ← render Clarify card with chips + input
+prompt.requested      ← request.prompt_kind='clarify'; chips + input
 status.update(approval) ← yes, 'approval' state reused for clarify
-— client POSTs /clarify/:id/answer —
-clarify.answered
+  ⏸  same durable pause as above
+— client POSTs /prompts/:id/respond {selected_chip_ids, text} —
+prompt.responded      ← response.prompt_kind='clarify'
 content.delta × N     ← assistant continues with the structured answer
 node.finalized
 active_leaf.changed
 ```
+
+Note there is **no `toolcall.started`/`toolcall.ended` pair** for a
+clarify: `ask_clarification` is a pause mechanic, not an executable tool.
+The answer is folded into the model's context and the turn continues.
 
 **Turn with a reasoning model (deepseek-r1, qwq, etc.):**
 
@@ -820,12 +982,12 @@ for now, a direct DB update is the escape hatch).
 - `reasoning.delta` may interleave with `content.delta` in theory, but
   the current splitter emits all segments in stream-arrival order,
   which for any model we've seen means: reasoning first, then content.
-- **`approval.decided` / `clarify.answered` arrive after the HTTP 200,
-  not before it.** They are emitted by the graph as it resumes, which is
-  what keeps them correctly ordered against the `toolcall.started` /
-  `toolcall.ended` events that follow. Don't await the event inside the
-  click handler; treat the 200 as "recorded" and let the stream drive UI.
-- There is no ordering guarantee *between* a decision's HTTP response and
+- **`prompt.responded` arrives after the HTTP 200, not before it.** It is
+  emitted by the graph as it resumes, which is what keeps it correctly
+  ordered against the `toolcall.started` / `toolcall.ended` events that
+  follow. Don't await the event inside the click handler; treat the 200 as
+  "recorded" and let the stream drive UI.
+- There is no ordering guarantee *between* a response's HTTP result and
   its stream event. Either can land first.
 
 ### 4.6 Reconnect with `since_event`
@@ -918,8 +1080,8 @@ interface MessageNode {
   content: string;
   reasoning?: string[];    // one string per closed <think> block
   toolCall?: ToolCallData;
-  clarify?: ClarifyData;
-  approval?: ApprovalData;
+  clarify?: ClarifyData;   // see caveat below
+  approval?: ApprovalData; // see caveat below
   streaming?: boolean;
   status?: StatusState;
   edited?: boolean;        // true if the node is a branch-via-edit
@@ -932,6 +1094,23 @@ interface MessageTree {
   nodes: Record<string, MessageNode>;  // flat map, not nested
 }
 ```
+
+**Caveat on `approval` / `clarify` — a tree fetch tells you nothing about
+an open prompt.** Verified against a live turn:
+
+- **`approval` is never written by the runtime.** It exists in the schema
+  and `insertNode` accepts it, but no code path sets it — it is `null`
+  while a prompt is open *and* after it is answered. Only `POST /dev/seed`
+  fixtures populate it, which is why it looks real in sample data.
+- **`clarify` is written only *after* the answer**, rewritten with
+  `selected: true|false` on each chip. While the prompt is open it is
+  `null`.
+
+So in both cases the node row is empty at exactly the moment you'd want
+to render a card. **Get prompt state from
+`GET /conversations/:id/prompts?pending=true` or from the
+`prompt.requested` / `prompt.responded` events** — never by inferring it
+from `node.approval`.
 
 ### 5.3 Agent (wire vs. full)
 
@@ -1098,7 +1277,7 @@ The server synthesizes these from the raw `events` table at request
 time — no backing storage. So timeline rows on seeded (not-live)
 conversations can be empty if no events were ever published.
 
-### 5.8 Approvals (grants listing)
+### 5.8 Grants listing
 
 ```ts
 interface Grant {
@@ -1106,6 +1285,22 @@ interface Grant {
   agent_id: string;
   tool_id: string;
   created_at: string;
+}
+```
+
+### 5.8b Prompt
+
+```ts
+interface PromptRow {
+  id: string;                        // "pr-f015ff0b"
+  conversation_id: string;
+  node_id: string;                   // the assistant node that paused
+  kind: 'approval' | 'clarify';
+  tool: string;                      // 'ask_clarification' for clarify
+  request: PromptRequest;            // §4.3
+  response: PromptResponse | null;   // null while open
+  responded_at: string | null;       // ISO
+  created_at: string;                // ISO — use this to age the card
 }
 ```
 
@@ -1181,8 +1376,7 @@ function subscribe(convId: string, lastEventId: string | null, onEvent: Handler)
     'node.created', 'status.update', 'content.delta',
     'reasoning.delta', 'reasoning.step.end',
     'toolcall.proposed', 'toolcall.started', 'toolcall.ended',
-    'approval.requested', 'approval.decided',
-    'clarify.requested', 'clarify.answered',
+    'prompt.requested', 'prompt.responded',
     'artifact.updated',
     'node.finalized', 'active_leaf.changed', 'error',
   ];
@@ -1278,25 +1472,33 @@ function reduce(state: MessageTree, ev: BusEvent): MessageTree {
       };
     }
 
-    case 'approval.requested': {
+    // One case for both pause kinds. Note it keys the open prompt by
+    // prompt_id — several can be open at once, so a single
+    // `node.approval` slot is the wrong shape to grow into.
+    case 'prompt.requested': {
       const node = state.nodes[ev.node_id]!;
+      const patch =
+        ev.request.prompt_kind === 'approval'
+          ? { approval: ev.request.approval }
+          : { clarify: ev.request.clarify };
       return {
         ...state,
+        openPrompts: { ...state.openPrompts, [ev.prompt_id]: ev },
         nodes: {
           ...state.nodes,
-          [ev.node_id]: { ...node, approval: ev.approval, status: 'approval' },
+          [ev.node_id]: { ...node, ...patch, status: 'approval' },
         },
       };
     }
 
-    case 'clarify.requested': {
-      const node = state.nodes[ev.node_id]!;
+    // Do NOT leave this a no-op. It is what stops an already-answered
+    // prompt from rendering live buttons after a reload.
+    case 'prompt.responded': {
+      const { [ev.prompt_id]: _answered, ...rest } = state.openPrompts;
       return {
         ...state,
-        nodes: {
-          ...state.nodes,
-          [ev.node_id]: { ...node, clarify: ev.clarify, status: 'approval' },
-        },
+        openPrompts: rest,
+        answeredPrompts: { ...state.answeredPrompts, [ev.prompt_id]: ev.response },
       };
     }
 
@@ -1310,51 +1512,76 @@ A clean drop-in: maintain a `lastEventId` alongside the tree and pass
 it to `subscribe()` on mount. Every reducer call should also update
 `lastEventId = ev.id`.
 
-### 6.5 Approval round-trip
+### 6.5 Prompt round-trip (approvals and clarifications)
 
-When the user clicks a decision on an `ApprovalCard`:
+One call for both kinds. The body differs; the endpoint does not.
 
 ```ts
-async function decideApproval(
-  approvalId: string,
-  decision: 'allow' | 'always' | 'deny',
-) {
-  return fetch(`${base}/approvals/${approvalId}/decide`, {
+type RespondBody =
+  | { decision: 'allow' | 'always' | 'deny'; edited_args?: Record<string, unknown> }
+  | { selected_chip_ids?: string[]; text?: string };
+
+async function respondToPrompt(promptId: string, body: RespondBody) {
+  const res = await fetch(`${base}/prompts/${promptId}/respond`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...hdr },
-    body: JSON.stringify({ decision }),
-  }).then((r) => r.json());
+    body: JSON.stringify(body),
+  });
+  // 409 means someone (or another tab) already answered it. That is a
+  // settled prompt, not a failure — render the winning response.
+  if (res.status === 409) {
+    const { response } = await res.json();
+    return { ok: true, settled: true, response };
+  }
+  if (!res.ok) throw new Error(`respond failed: ${res.status}`);
+  return res.json();
 }
+
+// Approve, but rewrite what the model proposed:
+await respondToPrompt('pr-f015ff0b', {
+  decision: 'allow',
+  edited_args: { path: 'edited-by-human.txt', content: 'the human rewrote this' },
+});
+
+// Answer a clarify:
+await respondToPrompt('pr-0e3ac2cb', {
+  selected_chip_ids: ['c-0'],
+  text: 'bullets, five max',
+});
 ```
 
-The server persists the decision, then resumes the paused turn from its
-checkpoint. `approval.decided` arrives on the stream as the graph
-resumes, followed by `toolcall.started` / `toolcall.ended` /
-`content.delta` / `node.finalized`.
+The server persists the response, then resumes the paused turn from its
+checkpoint. `prompt.responded` arrives on the stream as the graph resumes,
+followed by `toolcall.started` / `toolcall.ended` / `content.delta` /
+`node.finalized`.
 
-Three consequences worth designing for:
+Four consequences worth designing for:
 
 - **The gap can be arbitrarily long.** The pause is a checkpoint, not a
   waiting promise, so this works after the user closes the laptop or the
   server restarts. Nothing expires.
 - **`resumed: false` is not a failure.** It means there was no paused
-  turn to continue; the decision is still recorded.
-- **Don't derive the card's decided-state from this call succeeding.**
-  On reload the card rebuilds from `node.approval` and will show live
-  buttons for an already-decided approval. Drive it from
-  `approval.decided` (or from `409 already decided`) instead — §0.5.4.
+  turn to continue; the response is still recorded.
+- **Don't derive decided-state from this call succeeding.** On reload the
+  card rebuilds from the request event and will show live buttons for an
+  already-answered prompt. Drive it from `prompt.responded`, or fetch
+  `GET /conversations/:id/prompts?pending=true` on mount — §0.5.3.
+- **If you sent `edited_args`, the tool ran with those**, not with what
+  the model proposed. Render the edited values in history.
 
-### 6.6 Clarify round-trip
+### 6.6 Rebuilding open prompts after a reload
+
+Cheaper and more direct than replaying the event log:
 
 ```ts
-async function answerClarify(clarifyId: string, picks: string[], text: string) {
-  return fetch(`${base}/clarify/${clarifyId}/answer`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...hdr },
-    body: JSON.stringify({ selected_chip_ids: picks, text }),
-  }).then((r) => r.json());
-}
+const pending = await fetch(
+  `${base}/conversations/${convId}/prompts?pending=true`, { headers: hdr },
+).then((r) => r.json());
+// → PromptRow[] — render one card per row, keyed by row.id
 ```
+
+This is the only way to learn about an open prompt from a plain tree
+fetch: `GET /conversations/:id` does not carry prompt state.
 
 ### 6.7 Auth-friendly alternative to `EventSource`
 
@@ -1479,8 +1706,9 @@ Here's how each UI surface maps to a yap endpoint:
 | TreeView ripple-toggle preview | `GET /nodes/:id/ripple-preview` |
 | Composer Send | `POST /conversations/:id/messages` + subscribe |
 | StatusLine | Reduce `status.update` events |
-| ApprovalCard | Render `MessageNode.approval` + `approval_id` carried by `approval.requested` event. On click → `POST /approvals/:id/decide`. |
-| Clarify | Same pattern with `clarify_id` + `POST /clarify/:id/answer` |
+| ApprovalCard | Render `request.approval` + `prompt_id` from `prompt.requested`. On click → `POST /prompts/:id/respond` with `{decision, edited_args?}`. Clear on `prompt.responded`. |
+| Clarify | Same component pattern, same endpoint: `prompt.requested` with `request.prompt_kind: 'clarify'` → `POST /prompts/:id/respond` with `{selected_chip_ids, text}` |
+| Either card, after reload | `GET /conversations/:id/prompts?pending=true` |
 | ReasoningBlock | Render `MessageNode.reasoning: string[]` |
 | ToolCall | Render `MessageNode.toolCall` |
 | CanvasPane (preview) | `GET /artifacts/:id` |
@@ -1704,12 +1932,13 @@ If you're a developer (or an agent) about to wire chat-box:
    exactly like the events in §4.3 — no server needed.
 4. Open a stream on the active conversation and watch the Sidebar +
    main view come alive.
-5. Build the approval + clarify flows next; their endpoints are thin
-   (§3.5, §3.6) and the events arrive with all the context you need.
+5. Build the prompt flow next — one endpoint covers both approvals and
+   clarifications (§3.5) and the events arrive with all the context you
+   need. Key it by `prompt_id` from the start.
 6. Wire the CanvasPane last; it's the most self-contained of the
    panels (single artifact id → three endpoints).
 
-The yap server has 121 tests in `test/` that exercise every one of the
+The yap server has 138 tests in `test/` that exercise every one of the
 wire shapes documented here. If anything in this doc seems wrong
 against what the server actually does, `pnpm test` will catch the
 drift; the schemas in `src/schemas/*.ts` are the ground truth and
