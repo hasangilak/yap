@@ -142,6 +142,8 @@ Consequences: the tool needs a working Chromium on the host, is slow relative to
 
 The `--no-sandbox` patch is applied by `sed` against the vendored fork's build output, so it only exists **inside the image** — a host `pnpm install` gets an unpatched chrome-less, and sandbox-related behavior can differ between the two. The real fix is upstream in `hasangilak/chrome-cli` (a `CHROME_FLAGS` env hook); until then the `sed` is followed by a `grep -q` guard so a pin bump that moves the pattern fails the build instead of silently shipping a broken browser.
 
+All of the above is build-verified: `docker build --check` reports no warnings, both `CHROME_NO_SANDBOX=1` (patch present in `dist/chrome.js`) and `=0` (absent) build clean, and the resulting image boots and serves both HTTP surfaces against a host Postgres and Ollama. Note the build log carries a benign `WARN Failed to create bin at node_modules/.bin/chrome-less` — stage-1 deletes the npm-installed copy before the builder's copy is layered in, so the warning is expected and not a broken install.
+
 ### Database layer
 
 All Prisma access goes through **typed wrappers in `src/db/queries.ts`** — one function per logical op. API handlers and the runtime should not call `getPrisma()` directly except in narrow cases (the runtime has one documented façade for clarify JSON). This convention is what makes the DB integration test in `test/integration/db.test.ts` a meaningful contract.
@@ -153,6 +155,8 @@ Schema is 15 models in `prisma/schema.prisma`. The tree model: `Conversation` ha
 `Interjection` holds mid-turn steering text (see above). `Node.cancel_requested` is the stop flag.
 
 `POST /api/v1/dev/seed` (`src/api/dev.ts` + `src/seed/`) idempotently loads the chat-box `SAMPLE_*` fixtures — agents, conversations, and a branched node tree — to bring a fresh DB to a recognizable state. Safe to re-run; every insert is upsert-no-update.
+
+The seeder deliberately **overrides `streaming`/`status` to falsy** regardless of the fixture. In chat-box's sample data those fields are display hints ("draw a caret"); as DB rows they are a claim that a turn is mid-flight, which boot recovery acts on — `n-07` used to make every restart after a seed report a stranded turn and emit a bogus `error` on `c-01`. Keep the override in `dev.ts` rather than editing `SAMPLE_TREE_NODES`, which mirrors the client fixture.
 
 ### Schemas (`src/schemas/`)
 

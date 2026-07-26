@@ -284,10 +284,6 @@ Worth special-casing: it is not a model failure, and the right affordance
 is "regenerate", not "retry request". Recoverable turns produce no such
 event — they just continue.
 
-One caveat you will hit in dev: `POST /dev/seed` inserts a fixture node
-with `streaming: true` and no checkpoint, so **the first restart after a
-seed emits one of these errors for `c-01`**. It is an artifact of the
-fixture, not a real stranded turn.
 
 ### 0.5.7 Behaviour that is now genuinely different
 
