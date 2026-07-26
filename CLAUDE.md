@@ -60,14 +60,36 @@ Key invariants to preserve when editing:
 - **Subscribe-first replay in `src/api/stream.ts`.** The stream handler: (1) subscribes to the bus into a buffer, (2) replays persisted events to the wire recording ids, (3) flushes the buffer with id-dedupe, (4) switches to live pump. This closes a race where events emitted between replay-end and subscribe-active would be lost. Don't "simplify" this sequence.
 - **Named-event SSE vs. data-only SSE.** `/api/v1` uses named events (`event: node.created\ndata: {...}`) via `src/events/encoder.ts`. The AG-UI surface uses `@ag-ui/encoder`'s data-only frames. They are not interchangeable.
 
-### Runtime agent loop (`src/runtime/run.ts`)
+### Runtime agent loop (`src/runtime/graph/`)
 
-`runAssistantTurn` is an `AsyncGenerator<BusEvent>` that drives the model ⇄ tool loop, bounded by `config.maxToolRounds`. Coordination with HTTP handlers happens through two in-memory coordinators, both implemented as "insert DB row → await promise → HTTP handler resolves":
+The turn is a **LangGraph `StateGraph` checkpointed to Postgres**. `src/runtime/run.ts` is only a façade: `runAgent` / `runAssistantTurn` keep their `AsyncGenerator<BusEvent>` signatures and re-yield events the graph pushes onto its `custom` stream channel.
 
-- `runtime/approvals.ts` — `awaitDecision(approvalId)` blocks until `POST /approvals/:id/decide` resolves it. Three-layer permission model: per-call approval → per-conversation grant (`ApprovalGrant`) → agent-level `auto` flag.
-- `runtime/clarifications.ts` — `awaitAnswer(clarifyId)` blocks until `POST /clarify/:id/answer` resolves it. Triggered by the `ask_clarification` pseudo-tool.
+```
+prepare → callModel → gate → wait → resolvePrompt → execute
+              ▲         │                  │           │
+              │         └── auto-approved ─┴───────────┤
+              └───────────── next round ──────────────┘
+                                │
+                             finalize → END
+```
 
-Because these coordinators hold promises **in-process**, the server is single-instance by design. Don't introduce multi-process/worker assumptions without also persisting the coordinator state.
+**Rules that dictate this shape — violating any of them breaks pauses silently:**
+
+- **A node containing `interrupt()` re-executes from the top on resume.** So `gate` holds every side effect (persist the row, emit `approval.requested`) and `wait` contains *only* `interrupt()`. Never move side effects into `wait`.
+- **`interrupt()` propagates by throwing `GraphInterrupt`.** Never wrap `wait` in `try/catch`, or re-throw. The pre-graph loop wrapped a whole round in one `try/catch` that converted throws into `error` events; reintroducing that pattern around a pause turns every approval into a failed turn.
+- **Never call `interrupt()` in a loop over a dynamic list** — LangGraph matches interrupts by index, and the docs describe this as exponential re-execution. Tool calls are gated one per `gate`/`wait` pass with a conditional edge looping back.
+- **`durability: 'sync'`** on every graph call (`turnConfig`). The default `'async'` can lose a checkpoint if the process dies mid-execution — exactly the failure the graph exists to prevent.
+- The façade generator now **ends when the turn pauses**, not only when it completes, because a LangGraph stream terminates at an interrupt. "Generator finished" ≠ "turn finished". The continuation is a separate `resumeTurn()` from whichever endpoint received the answer.
+
+Human input is durable: `POST /approvals/:id/decide` and `POST /clarify/:id/answer` persist the response, then resume the graph thread. **`thread_id` is the assistant node id**, so a decision finds its paused turn from a database row alone — across requests and across restarts. `src/runtime/recovery.ts` runs before `serve()` and reconciles anything left mid-flight: waiting-on-human is left alone, crashed-between-supersteps is replayed with `null` input, and no-checkpoint gets `streaming` cleared plus a terminal `error`.
+
+The three-layer permission model is unchanged, now in `graph/nodes.ts#isAutoApproved`: session grant (`ApprovalGrant`) → agent `permission_default` → `TOOL_DEFS.auto`.
+
+`graph/checkpointer.ts` owns its own **`langgraph` Postgres schema** (`config.langgraphSchema`) so its four tables never register as drift against Prisma. `test/helpers/db.ts#truncateCheckpoints` clears them; `truncateAll` cannot reach another schema.
+
+`graph/steering.ts` is deliberately **in-memory** — it holds the `AbortController` for the in-flight model call, which cannot outlive the process anyway. Don't "fix" this by persisting it, and never derive that signal from an HTTP request: a client disconnect would kill a turn meant to outlive the request.
+
+The model call lives in `graph/model.ts` via `ChatOllama`. Streaming *and* tool-calling together is load-bearing and fragile upstream (the Python `langchain_ollama` has an open bug where `bindTools` silently collapses streaming into one chunk). `test/integration/runtime.test.ts` mocks `@langchain/ollama` with stringified `tool_call_chunks` to keep that path honest. Aborts are caught, never thrown, so the graph still checkpoints and partial output survives.
 
 ### Think-splitter
 
@@ -114,7 +136,7 @@ Zod schemas mirror `chat-box/src/types.ts` wire types. The `BusEvent` union in `
 - Prisma runs on `postinstall`, so `@prisma/client` types are always generated after `pnpm install`.
 - Commit message style: short imperative headline with a category prefix (`Testing:`, `API:`, `Runtime:`, `Docs:`, etc.) — follow `git log` for examples. Do not mention Claude/Claude Code in commit messages.
 - `src/ollama-agent.ts` is explicitly labeled "legacy" — it powers the AG-UI `POST /` surface and is stable. Feature work belongs in `src/api/` + `src/runtime/`, not here.
-- **`Phase N` / `PHASE-N:` comments are stale scaffolding, not a roadmap.** Several say things like "Phase 2 will gate these behind an approval round-trip" when approvals already ship (the `awaitDecision` call in `runtime/run.ts`). Trust the code and this file over those markers; delete them when you touch the surrounding lines.
+- **`Phase N` / `PHASE-N:` comments are stale scaffolding, not a roadmap.** Several say things like "Phase 2 will gate these behind an approval round-trip" when approvals already ship (see the `gate`/`wait` nodes in `runtime/graph/nodes.ts`). Trust the code and this file over those markers; delete them when you touch the surrounding lines.
 - All tunables funnel through `src/config.ts` (env with defaults) — read config there rather than `process.env` at use sites, and document each one in `.env.example`. The only sanctioned exceptions are process-level plumbing that isn't a product knob (`PATH`/`HOME`/`TMPDIR` when building the browser subprocess env) and `test/setup.ts`.
   
 
