@@ -25,6 +25,150 @@ a single fetch.**
 - A shared Postgres DB is the durable state of record. Every BusEvent
   is persisted before publication, so `GET /stream?since_event=<id>`
   always replays a clean tail after reconnect.
+- **Pauses for human input are now durable** (see §0.5). An approval or
+  clarification can be answered minutes later, or after a server
+  restart, and the turn still resumes.
+
+---
+
+## 0.5 Runtime change: durable human-in-the-loop
+
+The turn runtime is now a **LangGraph state graph checkpointed to
+Postgres**. This section is the whole story for a client: what actually
+changed on the wire, what didn't, and what is coming.
+
+### 0.5.1 What this fixes
+
+Previously a paused turn lived in an **in-process promise**. If the
+server restarted while an approval was on screen, the turn was gone
+forever: the `approvals` row stayed undecided, the assistant node stayed
+`streaming: true`, and nothing ever revisited it. The user's only signal
+was a card that never resolved and a spinner that never stopped.
+
+Now the pause is a checkpoint row. A decision resumes the turn from any
+request, in any process, at any later time.
+
+### 0.5.2 Breaking changes, shipped
+
+**For chat-box specifically: none.** We checked
+`src/api/approvals.ts`, `src/api/clarify.ts` and
+`src/state/threadReducer.ts` against this change — every event kind and
+payload is byte-identical, and the two response fields that changed are
+fields chat-box does not read. No code change is *required* to keep
+working. There is one behaviour change worth adopting, in §0.5.4.
+
+For any other client, the full list:
+
+| # | Change | Impact |
+|---|---|---|
+| 1 | `POST /approvals/:id/decide` response: `runtime_awake` → `resumed` | Breaks a client that read `runtime_awake`. chat-box types this as `{ok, decision}` and ignores it. |
+| 2 | `POST /clarify/:id/answer` response: `runtime_awake` → `resumed` | Same. chat-box types this as `{ok}`. |
+| 3 | `approval.decided` / `clarify.answered` now arrive **after** the HTTP 200, emitted by the graph | Breaks a client that assumed the event was already published when `decide()` resolved. chat-box's reducer treats both as no-ops, so it is unaffected. |
+
+`resumed: false` is not an error. It means there was no paused turn to
+continue — a turn whose checkpoint predates this feature, or one already
+finished. The decision is still persisted and the event still published.
+
+**No event kinds were added, removed, or renamed.** All 16 keep their
+exact payloads. `since_event` replay semantics are unchanged.
+
+### 0.5.3 One new message you may see
+
+Boot recovery reconciles turns that were mid-flight when the server
+stopped. A turn with no usable checkpoint now gets a terminal `error`:
+
+```
+turn was interrupted by a server restart and cannot be resumed
+```
+
+This is an existing kind (`error`), so chat-box already routes it to
+`lastError`. It is worth special-casing in the UI: it is not a model
+failure, and the right affordance is "regenerate", not "retry request".
+Turns that *were* recoverable produce no such event — they simply
+continue.
+
+### 0.5.4 The one thing chat-box should change
+
+`ApprovalCard` tracks its decided state in local component state:
+
+```tsx
+const [decision, setDecision] = useState<Decision | null>(null);
+// ...
+await decideApproval(approval.id, d);
+setDecision(d);
+```
+
+That was survivable when a pause could not outlive the page. It is now
+the weakest part of the flow, because a pause can outlive both the page
+and the server. On reload or reconnect the card rebuilds from
+`node.approval` — which `approval.requested` set and nothing clears — so
+an **already-decided approval renders with live buttons again**. Clicking
+returns `409 already decided`, which the card surfaces as a red error.
+
+The fix is to derive decided-state from the server rather than from a
+click. Options, cheapest first:
+
+1. Handle `approval.decided` in `threadReducer` (currently a no-op) by
+   patching the decision onto the node, and drive the card from that.
+   Because replay is authoritative, a full reconnect then reconstructs
+   decided-state for free, and a decision made in one open tab shows up
+   in another.
+2. Treat `409 already decided` as success — the response body carries
+   `{ error, decision }`, so the card can render the real outcome instead
+   of a red error.
+
+Do both; (1) is the substantive fix and (2) is the cheap backstop.
+
+**Important limitation to know before you design this.** The server does
+**not** persist approval state onto the node row. `Node.approval` exists
+in the schema and `insertNode` accepts it, but nothing in the turn
+runtime ever writes it — `updateNode` has no `approval` field at all. So
+the *only* source of truth for a client is the event stream:
+`approval.requested` and `approval.decided`.
+
+That means reconstructing a pending or decided approval requires
+**replaying events** (`GET /stream` with no `since_event`, or from a
+cursor that precedes the request). Fetching the node tree via
+`GET /conversations/:id` alone will not tell you an approval exists.
+chat-box already does the right thing here by building `node.approval` in
+the reducer from the event — just don't switch to a tree-only load and
+expect approvals to survive it.
+
+If you'd rather not depend on replay, say so: denormalizing the decision
+onto the node is a small server change and a reasonable thing to ask for.
+
+### 0.5.5 Behaviour that is now genuinely different
+
+- **A pause has no timeout.** It survives indefinitely. Don't build UI
+  that assumes a pending approval is fresh — show when it was requested.
+- **Reconnect mid-pause works.** `?since_event=<id>` replays the turn up
+  to the pause and then sits live, waiting. Verified end-to-end across a
+  `SIGKILL`.
+- **Turns outlive the request that started them.** Already true, now
+  more visible: `POST /messages` returns once the user node exists, and
+  everything after arrives on the stream.
+
+### 0.5.6 Coming next — this *will* break the wire
+
+Planned and agreed, not yet shipped. Do not build against it yet, but
+know it is coming so you don't invest in shapes that are about to move:
+
+- `approval.requested` / `approval.decided` / `clarify.requested` /
+  `clarify.answered` **collapse into `prompt.requested` /
+  `prompt.responded`**, with `kind: 'approval' | 'clarify'` inside.
+- `POST /approvals/:id/decide` and `POST /clarify/:id/answer` **collapse
+  into `POST /prompts/:id/respond`**.
+- Responses gain **`edited_args`**: the user will be able to modify a
+  proposed tool call's arguments before allowing it, not just
+  allow/deny.
+- **Several prompts can be open at once**, answerable in any order, so
+  prompt UI should not assume a single pending item per turn.
+- New `POST /conversations/:id/interject` to steer a turn mid-flight
+  without cancelling it.
+
+That set ships as one breaking change with chat-box updated in lockstep.
+The most useful thing you can do now is keep prompt rendering keyed by
+prompt id rather than by "the turn's one approval".
 
 ---
 
@@ -70,29 +214,34 @@ an approval model, and writes artifacts to a sandboxed directory.
 ### 1.3 Runtime flow (sketch)
 
 ```
-┌──────────────────┐    POST /messages      ┌─────────────────────┐
-│ chat-box client  │  ─────────────────────▶│ yap runtime/run.ts  │
-│                  │                        │                     │
-│ EventSource      │◀── SSE events ─────────│  ollama.chat()      │
-│ /stream          │                        │  executeTool()      │
-└──────────────────┘                        │  awaitDecision()    │
-                                            └─────────┬───────────┘
-                                                      │
-                                                      ▼
-                                            ┌─────────────────────┐
-                                            │ Postgres (Prisma)   │
-                                            │  nodes, events,     │
-                                            │  approvals, etc.    │
-                                            └─────────────────────┘
+┌──────────────────┐   POST /messages    ┌──────────────────────────┐
+│ chat-box client  │ ───────────────────▶│ LangGraph turn graph     │
+│                  │                     │                          │
+│ fetch stream     │◀── SSE events ──────│  prepare → callModel     │
+│ /stream          │                     │  gate → wait(pause!)     │
+│                  │                     │  execute → finalize      │
+│ POST /decide ────┼── resume ──────────▶│                          │
+└──────────────────┘                     └───────────┬──────────────┘
+                                                     │
+                                                     ▼
+                                       ┌──────────────────────────┐
+                                       │ Postgres                 │
+                                       │  public: nodes, events,  │
+                                       │    approvals, …          │
+                                       │  langgraph: checkpoints  │
+                                       └──────────────────────────┘
 ```
 
 - A user message creates a user node + fires an assistant turn.
 - The runtime streams content/reasoning/tool calls, persisting each
   event and publishing it onto the in-process bus.
 - One SSE channel per conversation carries those events to any open
-  client.
-- Server pauses on approval + clarify events and waits for a
-  POST from the client to resume.
+  client. The stream follows the **conversation**, not whoever is
+  producing — so it keeps working when a turn resumes in a later
+  request or a different process.
+- On approval/clarify the graph **checkpoints and stops**. A `POST` from
+  the client resumes it from that checkpoint. This is the part that used
+  to be an in-process promise; see §0.5.
 - Every mutation is durable in Postgres; reconnects replay from the
   `events` table.
 
@@ -285,11 +434,36 @@ interface PatchAgentResponse {
 | `GET` | `/approvals/grants` | List active `"allow always"` grants |
 | `DELETE` | `/approvals/grants/:key` | Revoke a grant; `key = tool:<tool>:agent:<agent_id>` |
 
+`POST /approvals/:id/decide` responses:
+
+```jsonc
+200 { "ok": true, "decision": "allow", "resumed": true }   // turn continued
+200 { "ok": true, "decision": "allow", "resumed": false }  // nothing to resume; still recorded
+404 { "error": "not found" }
+409 { "error": "already decided", "decision": "allow" }    // carries the real outcome
+```
+
+The decision is persisted **before** the turn is resumed, so an answer is
+never lost to a failure in between. `resumed` replaces the old
+`runtime_awake` field (§0.5.2). Treat `409` as "already settled" and
+render `decision` rather than showing an error — see §0.5.4.
+
 ### 3.6 Clarifications
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/clarify/:id/answer` | `{ selected_chip_ids: string[], text: string }` — resume the paused turn |
+
+```jsonc
+200 { "ok": true, "resumed": true }
+404 { "error": "not found" }
+409 { "error": "already answered" }
+```
+
+This endpoint previously did **not** persist the answer — it published
+the event and woke an in-process promise, leaving the DB write to the
+runtime afterwards, so with no runtime listening the answer was silently
+dropped. It now persists first, matching the approval path.
 
 ### 3.7 Artifacts
 
@@ -646,6 +820,13 @@ for now, a direct DB update is the escape hatch).
 - `reasoning.delta` may interleave with `content.delta` in theory, but
   the current splitter emits all segments in stream-arrival order,
   which for any model we've seen means: reasoning first, then content.
+- **`approval.decided` / `clarify.answered` arrive after the HTTP 200,
+  not before it.** They are emitted by the graph as it resumes, which is
+  what keeps them correctly ordered against the `toolcall.started` /
+  `toolcall.ended` events that follow. Don't await the event inside the
+  click handler; treat the 200 as "recorded" and let the stream drive UI.
+- There is no ordering guarantee *between* a decision's HTTP response and
+  its stream event. Either can land first.
 
 ### 4.6 Reconnect with `since_event`
 
@@ -1146,9 +1327,22 @@ async function decideApproval(
 }
 ```
 
-The server publishes `approval.decided` onto the stream, resumes the
-paused assistant turn, and subsequent `toolcall.started` /
-`toolcall.ended` / `content.delta` / `node.finalized` events follow.
+The server persists the decision, then resumes the paused turn from its
+checkpoint. `approval.decided` arrives on the stream as the graph
+resumes, followed by `toolcall.started` / `toolcall.ended` /
+`content.delta` / `node.finalized`.
+
+Three consequences worth designing for:
+
+- **The gap can be arbitrarily long.** The pause is a checkpoint, not a
+  waiting promise, so this works after the user closes the laptop or the
+  server restarts. Nothing expires.
+- **`resumed: false` is not a failure.** It means there was no paused
+  turn to continue; the decision is still recorded.
+- **Don't derive the card's decided-state from this call succeeding.**
+  On reload the card rebuilds from `node.approval` and will show live
+  buttons for an already-decided approval. Drive it from
+  `approval.decided` (or from `409 already decided`) instead — §0.5.4.
 
 ### 6.6 Clarify round-trip
 
