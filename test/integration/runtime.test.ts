@@ -99,6 +99,7 @@ import {
   insertInterjection,
   listPrompts,
   peekInterjections,
+  requestCancel,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
 import {
@@ -595,6 +596,160 @@ describe('runtime — mid-turn steering', () => {
       text: 'too late for this turn',
     });
     expect(await peekInterjections(asstId)).toHaveLength(1);
+  });
+});
+
+describe('runtime — cancellation', () => {
+  /**
+   * Stop means stop. A cancel arriving mid-round must end the turn even though
+   * the model proposed a tool call in that same round — otherwise "stop" would
+   * mean "stop after one more tool", and a side-effectful tool is exactly what
+   * a user hitting stop is trying to prevent.
+   */
+  it('a cancel mid-round outranks a tool call the model just proposed', async () => {
+    CHAT_SCRIPTS.push([
+      { content: 'thinking about it' },
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'should-not-exist.txt', content: 'nope' },
+            },
+          },
+        ],
+      },
+    ]);
+    // A second script is queued to prove it is never used.
+    CHAT_SCRIPTS.push([{ content: 'should never run' }]);
+
+    MID_STREAM.push(async () => {
+      const nodes = await getPrisma().node.findMany({
+        where: { conversationId: 'c-r', role: 'asst' },
+        select: { id: true },
+      });
+      await requestCancel(nodes[0]!.id);
+    });
+
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const kinds = events.map((e) => e.kind);
+
+    // Exactly one round, and the tool never ran or asked for approval.
+    expect(STREAM_CALLS).toHaveLength(1);
+    expect(kinds).not.toContain('toolcall.started');
+    expect(kinds).not.toContain('prompt.requested');
+    expect(kinds).toContain('node.finalized');
+
+    // The node is closed out properly, not left mid-flight.
+    const node = await getPrisma().node.findFirstOrThrow({
+      where: { conversationId: 'c-r', role: 'asst' },
+    });
+    expect(node.streaming).toBe(false);
+    expect(node.status).toBeNull();
+  });
+
+  /**
+   * Cancel must also beat steering — if both a cancel and an interjection are
+   * outstanding, the turn stops rather than running another round.
+   */
+  it('a cancel beats pending steering', async () => {
+    CHAT_SCRIPTS.push([{ content: 'round one' }, { content: ' continues' }]);
+    CHAT_SCRIPTS.push([{ content: 'should never run' }]);
+
+    MID_STREAM.push(async () => {
+      const nodes = await getPrisma().node.findMany({
+        where: { conversationId: 'c-r', role: 'asst' },
+        select: { id: true },
+      });
+      await insertInterjection({
+        id: 'ij-and-cancel',
+        conversation_id: 'c-r',
+        node_id: nodes[0]!.id,
+        text: 'steer me',
+      });
+      await requestCancel(nodes[0]!.id);
+    });
+
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'go' }),
+    );
+    expect(STREAM_CALLS).toHaveLength(1);
+    expect(events.map((e) => e.kind)).toContain('node.finalized');
+  });
+
+  /**
+   * Regression: cancelling a turn **parked on a prompt** must finalize it.
+   *
+   * Nothing else will — the graph is sitting at an `interrupt()` waiting for a
+   * human who is never going to answer. This was broken in two ways at once:
+   * `callModel` never cleared its AbortController, so `abortActiveRound` found
+   * a stale one and reported `aborted: true`; and the finalize branch was
+   * gated on `!aborted`, so it was skipped and the node stayed `streaming`
+   * forever. Found by cancelling a real parked turn.
+   *
+   * Driven through the HTTP handler because the bug lived in the interaction
+   * between the endpoint and the checkpoint, not in either alone.
+   */
+  it('cancelling a turn parked on a prompt finalizes it', async () => {
+    const { cancelRouter } = await import('../../src/api/cancel.js');
+    const { Hono } = await import('hono');
+    const app = new Hono().route('/', cancelRouter);
+
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'x.txt', content: 'y' },
+            },
+          },
+        ],
+      },
+    ]);
+
+    const first = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'do it' }),
+    );
+    const asstId = (
+      first.find((e) => e.kind === 'prompt.requested') as { node_id: string }
+    ).node_id;
+    expect(await getPendingInterrupts(asstId)).toHaveLength(1);
+
+    const res = await app.fetch(
+      new Request('http://localhost/conversations/c-r/cancel', { method: 'POST' }),
+    );
+    const body = (await res.json()) as { aborted: boolean; finalized: boolean };
+
+    // Parked means no live round, so we must not claim to have aborted one...
+    expect(body.aborted).toBe(false);
+    // ...and the endpoint must close the node itself.
+    expect(body.finalized).toBe(true);
+
+    const node = await getPrisma().node.findUniqueOrThrow({ where: { id: asstId } });
+    expect(node.streaming).toBe(false);
+    expect(node.status).toBeNull();
+    expect(node.cancelRequested).toBe(true);
+  });
+
+  it('partial content produced before the cancel is kept', async () => {
+    CHAT_SCRIPTS.push([{ content: 'keep this text' }, { content: ' and this' }]);
+
+    MID_STREAM.push(async () => {
+      const nodes = await getPrisma().node.findMany({
+        where: { conversationId: 'c-r', role: 'asst' },
+        select: { id: true },
+      });
+      await requestCancel(nodes[0]!.id);
+    });
+
+    await drain(runAgent({ conversationId: 'c-r', parent: null, content: 'go' }));
+    const node = await getPrisma().node.findFirstOrThrow({
+      where: { conversationId: 'c-r', role: 'asst' },
+    });
+    expect(node.content).toContain('keep this text');
   });
 });
 

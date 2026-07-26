@@ -3,6 +3,7 @@ import {
   getConversationRaw,
   getPrompt,
   insertGrant,
+  isCancelRequested,
   listPrompts,
   recordPromptResponse,
   type PromptRow,
@@ -114,6 +115,19 @@ promptsRouter.post('/:id/respond', async (c) => {
   if (response.prompt_kind === 'approval' && response.decision === 'always') {
     const conv = await getConversationRaw(row.conversationId);
     if (conv) await insertGrant(conv.agentId, row.tool);
+  }
+
+  // A cancelled turn must not be resumed by a decision that arrives after the
+  // stop. The response is already recorded above, so nothing is lost — the turn
+  // simply stays ended.
+  if (await isCancelRequested(row.threadId)) {
+    return c.json({
+      ok: true,
+      prompt_id: id,
+      kind: row.kind,
+      resumed: false,
+      cancelled: true,
+    });
   }
 
   // The thread id is stored on the row, so the paused turn is one lookup away.

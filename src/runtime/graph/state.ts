@@ -124,6 +124,15 @@ export const TurnState = new StateSchema({
    */
   pendingSteering: z.boolean(),
 
+  /**
+   * True when the user asked this turn to stop (`POST /:id/cancel`).
+   *
+   * Read from the node row after each round rather than pushed in, because the
+   * cancel arrives on a different request than the one running the turn — the
+   * DB is the only channel both sides share.
+   */
+  cancelRequested: z.boolean(),
+
   /** Set when the loop should stop before the round budget is spent. */
   done: z.boolean(),
 });

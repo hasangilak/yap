@@ -7,6 +7,7 @@ import {
   getConversationRaw,
   consumeInterjections,
   hasGrant,
+  isCancelRequested,
   insertGrant,
   insertNode,
   insertPrompt,
@@ -32,7 +33,7 @@ import { DEFAULT_SYSTEM_PROMPT } from '../../system-prompt.js';
 import { envelope, makeEmit } from './emit.js';
 import { streamModelRound } from './model.js';
 import type { NormalizedToolCall, OpenPrompt, TurnStateValue } from './state.js';
-import { takeAbortController } from './steering.js';
+import { clearAbortController, takeAbortController } from './steering.js';
 
 /**
  * The turn graph's nodes.
@@ -219,6 +220,12 @@ export async function callModelNode(
     },
   });
 
+  // The round is over: drop the controller so nothing can later "abort" a call
+  // that already finished. Leaving it behind made `POST /cancel` report
+  // `aborted: true` for a turn parked on a prompt, which in turn skipped the
+  // branch that finalizes a parked node — stranding it as `streaming` forever.
+  clearAbortController(asstNodeId);
+
   // The round is over, so the steering text it carried has been delivered.
   // Deliberately after `streamModelRound`, not before it.
   await consumeInterjections(pending.map((row) => row.id));
@@ -229,6 +236,10 @@ export async function callModelNode(
   // an aborted round has no tool calls, so without it the turn would finalize
   // having accepted the user's steering and never used it.
   const stillPending = await peekInterjections(asstNodeId);
+
+  // The cancel arrives on a different request than the one running this turn,
+  // so the node row is the only channel the two share.
+  const cancelled = await isCancelRequested(asstNodeId);
 
   for (const [i, text] of result.reasoningSteps.entries()) {
     emit({
@@ -290,6 +301,7 @@ export async function callModelNode(
     messages: [...injected, assistantMessage],
     pendingToolCalls: result.toolCalls,
     pendingSteering: stillPending.length > 0,
+    cancelRequested: cancelled,
     round: state.round + 1,
     done: false,
   };
@@ -686,6 +698,9 @@ export function afterCallModel(
   state: TurnStateValue,
 ): 'gate' | 'callModel' | 'finalize' {
   if (state.done) return 'finalize';
+  // A cancel outranks every continuation path — including a tool call the model
+  // just proposed. Stopping means stopping, not "after one more tool".
+  if (state.cancelRequested) return 'finalize';
   if (state.round >= config.maxToolRounds) return 'finalize';
   if (state.pendingToolCalls.length > 0) return 'gate';
   // No tool calls, but the user steered mid-round. An aborted round looks

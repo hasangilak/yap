@@ -300,7 +300,64 @@ fixture, not a real stranded turn.
   visible: `POST /messages` returns once the user node exists, and
   everything after arrives on the stream.
 
-### 0.5.8 Still coming
+### 0.5.8 Mid-turn steering (additive — nothing breaks)
+
+`POST /api/v1/conversations/:id/interject` pushes text into a turn that
+is **already running**, without cancelling it. Think "actually, stop and
+just summarise" while the assistant is three paragraphs into an essay.
+
+```jsonc
+POST /api/v1/conversations/c-1/interject
+{ "text": "Stop the essay. Reply with only: I was steered." }
+
+200 { "ok": true, "interjection_id": "ij-972aaaa8",
+      "node_id": "n-624fb540", "aborted": true }
+409 { "error": "no turn in flight for this conversation" }
+400 { "error": "invalid body", "expected": { "text": "non-empty string" }, ... }
+```
+
+One new event kind, `interjection.received` — **additive**, so a client
+that ignores unknown kinds is unaffected:
+
+```jsonc
+{
+  "kind": "interjection.received",
+  "node_id": "n-624fb540",
+  "interjection_id": "ij-972aaaa8",
+  "text": "Stop the essay. Reply with only: I was steered.",
+  "aborted": true
+}
+```
+
+**What `aborted` means, and why you want it in the UI.** `true` means the
+model was genuinely cut off mid-sentence, so the `content.delta`s that
+came before it end in a half-finished thought. `false` means there was no
+live model call to interrupt — the turn was paused on a prompt, between
+rounds, or running in another process — and the text is queued for the
+next round instead. **`false` is not an error**; the interjection is
+recorded either way.
+
+Verified end-to-end against a live model: 11 deltas of essay, interject,
+`aborted: true`, then the turn continued into a new round and finished
+with `"To write an essay on the history of Dutch windmills,I was steered
+mid-turn."` Note the shape of that string — the partial text is
+**kept**, not discarded, and the steered reply is appended to it. If you
+render `node.content` you will see the seam. That is deliberate: throwing
+away tokens the user already watched arrive would be worse.
+
+Three things to design for:
+
+- **The turn does not end.** It keeps streaming, so don't tear down the
+  live UI on a 200. Steering is not cancellation; there is no cancel
+  endpoint.
+- **The text is durable, the abort is not.** The row is written before the
+  response, so an interjection survives a restart — tested by killing the
+  server mid-round and watching boot recovery replay it and apply it. The
+  abort is best-effort on top.
+- **Steering rounds are capped** by `MAX_TOOL_ROUNDS`, the same budget as
+  tool loops. A user cannot keep a turn alive forever by interjecting.
+
+### 0.5.9 Still coming
 
 Not shipped, not yet breaking:
 
@@ -308,9 +365,6 @@ Not shipped, not yet breaking:
   already shaped for it (`prompt_id`-keyed, `?pending=true` returns a
   list) — the runtime still gates one tool call at a time, so today you
   will only ever see one open. Build for the list anyway.
-- **`POST /conversations/:id/interject`** to steer a turn mid-flight
-  without cancelling it. The runtime plumbing exists; the endpoint does
-  not.
 
 ---
 

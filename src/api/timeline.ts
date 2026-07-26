@@ -63,6 +63,15 @@ function mapEvent(ev: BusEvent): TimelineEvent | null {
         sub: ev.aborted ? 'Interjected (model cut short)' : 'Interjected (queued)',
         status: null,
       };
+    case 'turn.cancelled':
+      return {
+        ...common,
+        node_id: ev.node_id,
+        kind: 'error',
+        label: 'Turn stopped by user',
+        sub: ev.aborted ? 'Model cut short' : 'Was awaiting input',
+        status: null,
+      };
     case 'prompt.responded': {
       if (ev.response.prompt_kind === 'clarify') {
         const { answer } = ev.response;

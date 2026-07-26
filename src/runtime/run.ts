@@ -8,7 +8,6 @@ import {
 } from '../db/queries.js';
 import { envelope } from './graph/emit.js';
 import { getTurnGraph, turnConfig } from './graph/index.js';
-import { clearAbortController } from './graph/steering.js';
 import type { BusEvent } from '../events/types.js';
 import type { MessageNode } from '../schemas/index.js';
 
@@ -161,6 +160,7 @@ export async function* runAssistantTurn(input: {
     resolvedToolCalls: [],
     pendingApproved: false,
     pendingSteering: false,
+    cancelRequested: false,
     done: false,
   };
 
@@ -198,9 +198,4 @@ export async function* continueTurn(input: {
   asstNodeId: string;
 }): AsyncGenerator<BusEvent, void, unknown> {
   yield* drive(input.conversationId, input.asstNodeId, null);
-}
-
-/** Release process-local steering state for a finished turn. */
-export function releaseTurn(asstNodeId: string): void {
-  clearAbortController(asstNodeId);
 }

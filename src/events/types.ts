@@ -12,6 +12,7 @@ export {
   PromptRequestedEventSchema,
   PromptRespondedEventSchema,
   InterjectionReceivedEventSchema,
+  TurnCancelledEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
   ErrorEventSchema,

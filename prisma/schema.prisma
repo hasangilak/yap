@@ -102,6 +102,12 @@ model Node {
   approval       Json?
   streaming      Boolean  @default(false)
   status         String?
+  /// Set by `POST /conversations/:id/cancel` — the user asked this turn to
+  /// stop. Durable rather than in-memory because boot recovery replays
+  /// unfinished turns: an in-memory flag would let a restart resurrect a turn
+  /// the user had already stopped. Also what makes a late
+  /// `POST /prompts/:id/respond` a 409 instead of resuming a cancelled turn.
+  cancelRequested Boolean @default(false) @map("cancel_requested")
   edited         Boolean  @default(false)
   editedFromId   String?  @map("edited_from_id")
   createdAt      DateTime @default(now()) @map("created_at")

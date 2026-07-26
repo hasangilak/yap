@@ -169,6 +169,24 @@ export const InterjectionReceivedEventSchema = Base.extend({
   aborted: z.boolean(),
 });
 
+/**
+ * The user stopped the turn (`POST /conversations/:id/cancel`).
+ *
+ * Distinct from a plain `node.finalized` so a client can render "stopped" rather
+ * than "complete" — the assistant text ends mid-thought and that should look
+ * deliberate, not like a truncated success.
+ *
+ * `aborted` says whether a live model call was cut off. `finalized` says the
+ * cancel endpoint closed the node itself, which happens when the turn was parked
+ * on a prompt and no round was going to come back and do it.
+ */
+export const TurnCancelledEventSchema = Base.extend({
+  kind: z.literal('turn.cancelled'),
+  node_id: z.string(),
+  aborted: z.boolean(),
+  finalized: z.boolean(),
+});
+
 export const ArtifactUpdatedEventSchema = Base.extend({
   kind: z.literal('artifact.updated'),
   artifact_id: z.string(),
@@ -196,6 +214,7 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   PromptRequestedEventSchema,
   PromptRespondedEventSchema,
   InterjectionReceivedEventSchema,
+  TurnCancelledEventSchema,
   ArtifactUpdatedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,

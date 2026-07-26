@@ -199,6 +199,13 @@ describe('schemas — BusEvent discriminated union', () => {
       },
       {
         ...base,
+        kind: 'turn.cancelled',
+        node_id: 'n',
+        aborted: true,
+        finalized: false,
+      },
+      {
+        ...base,
         kind: 'artifact.updated',
         artifact_id: 'art',
         version_id: 'av',

@@ -3,6 +3,7 @@ import { agentsRouter } from './agents.js';
 import { templatesRouter } from './agent-templates.js';
 import { approvalsRouter } from './approvals.js';
 import { artifactsRouter } from './artifacts.js';
+import { cancelRouter } from './cancel.js';
 import { conversationsRouter } from './conversations.js';
 import { devRouter } from './dev.js';
 import { exportShareRouter } from './export-share.js';
@@ -27,6 +28,7 @@ apiV1.route('/', notesRouter);
 apiV1.route('/', timelineRouter);
 apiV1.route('/', conversationPromptsRouter);
 apiV1.route('/', interjectRouter);
+apiV1.route('/', cancelRouter);
 apiV1.route('/', exportShareRouter);
 apiV1.route('/search', searchRouter);
 

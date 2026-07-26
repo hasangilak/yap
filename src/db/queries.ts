@@ -1104,6 +1104,31 @@ export async function rippleCounts(
   return { descendant_count: ids.length, tool_calls_to_replay: tools, approvals_required: approvals };
 }
 
+// -- cancellation -------------------------------------------------------------
+
+/**
+ * Mark a turn as cancelled by the user.
+ *
+ * Durable, and that matters for two reasons beyond surviving a restart:
+ * boot recovery replays unfinished turns, so an in-memory flag would let a
+ * restart resurrect a turn the user stopped; and a prompt response arriving
+ * after the cancel must be rejected rather than resuming it.
+ */
+export async function requestCancel(nodeId: string): Promise<void> {
+  await getPrisma().node.update({
+    where: { id: nodeId },
+    data: { cancelRequested: true },
+  });
+}
+
+export async function isCancelRequested(nodeId: string): Promise<boolean> {
+  const row = await getPrisma().node.findUnique({
+    where: { id: nodeId },
+    select: { cancelRequested: true },
+  });
+  return row?.cancelRequested === true;
+}
+
 // -- interjections (mid-turn steering) ----------------------------------------
 
 export async function insertInterjection(input: {

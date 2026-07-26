@@ -1,4 +1,8 @@
-import { listUnfinishedAssistantNodes, updateNode } from '../db/queries.js';
+import {
+  isCancelRequested,
+  listUnfinishedAssistantNodes,
+  updateNode,
+} from '../db/queries.js';
 import { publish } from '../events/bus.js';
 import { envelope } from './graph/emit.js';
 import {
@@ -15,6 +19,9 @@ import { continueTurn } from './run.js';
  * before the server accepts connections. Every assistant node still flagged
  * `streaming` falls into one of three cases:
  *
+ *  0. **Cancelled by the user.** `cancel_requested` is set, so the turn is
+ *     finalized without replaying anything. Checked first — replaying would
+ *     spend a whole model round only to stop.
  *  1. **Waiting on a human.** The checkpoint has a pending interrupt, so the
  *     turn is already durable — leave it exactly as it is. The next
  *     `POST /prompts/:id/respond` will resume it. Previously this state was
@@ -33,9 +40,10 @@ import { continueTurn } from './run.js';
 export async function recoverInterruptedTurns(): Promise<{
   waiting: number;
   resumed: number;
+  cancelled: number;
   failed: number;
 }> {
-  const summary = { waiting: 0, resumed: 0, failed: 0 };
+  const summary = { waiting: 0, resumed: 0, cancelled: 0, failed: 0 };
 
   let stranded: { id: string; conversationId: string }[];
   try {
@@ -49,6 +57,26 @@ export async function recoverInterruptedTurns(): Promise<{
 
   for (const node of stranded) {
     try {
+      // A turn the user stopped must not come back to life. Checked before
+      // everything else: replaying it would run a whole model round only to
+      // finalize, and leaving it `streaming` would show a live spinner for a
+      // turn that was deliberately ended.
+      if (await isCancelRequested(node.id)) {
+        const finalized = await updateNode(node.id, {
+          streaming: false,
+          status: null,
+        });
+        await publish({
+          kind: 'turn.cancelled',
+          ...envelope(node.conversationId),
+          node_id: node.id,
+          aborted: false,
+          finalized: finalized !== null,
+        });
+        summary.cancelled++;
+        continue;
+      }
+
       const pending = await getPendingInterrupts(node.id);
       if (pending.length > 0) {
         summary.waiting++;
@@ -86,7 +114,8 @@ export async function recoverInterruptedTurns(): Promise<{
 
   console.log(
     `[recovery] ${stranded.length} interrupted turn(s): ` +
-      `${summary.waiting} waiting on input, ${summary.resumed} resumed, ${summary.failed} failed`,
+      `${summary.waiting} waiting on input, ${summary.resumed} resumed, ` +
+      `${summary.cancelled} cancelled, ${summary.failed} failed`,
   );
   return summary;
 }
