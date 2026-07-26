@@ -3,8 +3,9 @@
 A local LLM server with two personalities on one port.
 
 **`/api/v1/*`** — a full chat-product backend: conversation trees,
-streamed reasoning + content + tool calls, approvals + clarifications,
-versioned agents, artifacts with diffs, tags/notes/snippets/search/
+streamed reasoning + content + tool calls, durable human-in-the-loop
+prompts (approve / edit-then-approve / clarify), versioned agents,
+artifacts with diffs, tags/notes/snippets/search/
 export/share, auth + idempotency + rate limits. Consumed by
 [`chat-box`](https://github.com/hasangilak/chat-box).
 
@@ -155,6 +156,7 @@ The `/api/v1/*` surface implements every endpoint in
 |---|---|
 | Phase 1 | Conversation CRUD + message tree + SSE stream + `web_search` tool |
 | Phase 2 | Tool approvals + "allow always" grants + three-layer permission model |
+| LangGraph | Turn runtime is a Postgres-checkpointed `StateGraph`; pauses survive restarts. Approvals + clarifications unified into one `Prompt` model with `edited_args` |
 | Phase 3 | Edit (creates branch) / regenerate / branch / prune / ripple-preview |
 | Phase 4 | Agents CRUD + versions + restore + diff + templates + optimizer/eval stubs |
 | Phase 5a | Clarifications via `ask_clarification` pseudo-tool |
@@ -176,8 +178,8 @@ src/
     nodes.ts             edit, branch, regenerate, prune, ripple-preview
     agents.ts            agents CRUD + versions + restore + diff
     agent-templates.ts   templates catalog, from-template, optimize + eval stubs
-    approvals.ts         decide, list grants, revoke grant
-    clarify.ts           clarify answer endpoint
+    prompts.ts           respond to a prompt, get one, list pending
+    approvals.ts         list grants, revoke grant
     artifacts.ts         preview, versions, diff
     tags.ts              CRUD
     notes.ts             thread note + pinned snippets
@@ -191,9 +193,16 @@ src/
       rate-limit.ts      sliding-window per identity
 
   runtime/
-    run.ts               agent loop: runAgent + runAssistantTurn generators
-    approvals.ts         pending-decision coordinator
-    clarifications.ts    pending-answer coordinator
+    run.ts               façade: runAgent / runAssistantTurn / resumeTurn
+    recovery.ts          boot reconciliation of turns left mid-flight
+    graph/
+      index.ts           StateGraph assembly + turnConfig (durability:'sync')
+      nodes.ts           prepare, callModel, gate, wait, resolvePrompt,
+                         execute, finalize — plus the routing predicates
+      state.ts           checkpointable turn state (plain JSON only)
+      model.ts           ChatOllama streaming round + abort handling
+      checkpointer.ts    PostgresSaver on its own `langgraph` schema
+      steering.ts        in-memory AbortController per in-flight model call
     think-splitter.ts    streaming <think>…</think> parser
 
   db/
@@ -214,13 +223,14 @@ src/
   system-prompt.ts       default assistant prompt
   server.ts              Hono app wiring
 
-prisma/schema.prisma     15 models: Conversation, Node, Agent, AgentVersion,
-                         Event, Approval, ApprovalGrant, Clarify, Artifact,
+prisma/schema.prisma     14 models: Conversation, Node, Agent, AgentVersion,
+                         Event, Prompt, ApprovalGrant, Artifact,
                          ArtifactVersion, Tag, ConversationTag, ThreadNote,
                          PinnedSnippet, IdempotencyRecord
+                         (LangGraph owns 4 more in the `langgraph` schema)
 
-test/                    121 tests across 13 files
-  unit/                  schemas, splitter, encoder, coordinators, tools
+test/                    138 tests across 13 files
+  unit/                  schemas, splitter, encoder, tools
                          sandbox, auth, rate-limit
   integration/           db queries, API endpoints, mocked-Ollama runtime,
                          idempotency with real DB
@@ -256,22 +266,29 @@ pnpm test:unit           # pure-module tests only (no DB needed)
 pnpm test:integration    # DB + API + runtime with mocked Ollama
 ```
 
-121 tests covering:
+138 tests covering:
 
-- Pure modules: `ThinkSplitter`, SSE encoder, approval/clarify
-  coordinators, rate-limit bucket arithmetic, `write_file` sandbox
-  path traversal, schema round-trip through every `SAMPLE_*` fixture,
-  full `BusEvent` discriminated-union coverage, bearer auth.
+- Pure modules: `ThinkSplitter`, SSE encoder, rate-limit bucket
+  arithmetic, `write_file` sandbox path traversal, schema round-trip
+  through every `SAMPLE_*` fixture, full `BusEvent`
+  discriminated-union coverage (including that a prompt whose
+  `prompt_kind` disagrees with its payload is rejected), bearer auth.
 - DB layer: every Prisma helper in `src/db/queries.ts` — conversation/
-  node/agent/artifact/approval/clarify/tag/event CRUD, branch naming,
-  subtree walking, ripple-count arithmetic, version chains.
+  node/agent/artifact/prompt/tag/event CRUD, branch naming,
+  subtree walking, ripple-count arithmetic, version chains, and the
+  prompt-response compare-and-set under concurrent writers.
 - API layer: every `/api/v1` endpoint — conversations, agents +
   versions + templates + stubs, tools, tags, notes, pinned snippets,
   timeline synthesis, search highlighting, export, share mint/read/
   revoke, seed fixtures.
-- Runtime: `vi.hoisted` scripted Ollama + mocked chrome-less. Happy
-  path, tool-call round-trip, approval deny/allow, token budget
-  refusal, `<think>` tag splitting, unknown-conversation error.
+- Runtime: `vi.hoisted` scripted `@langchain/ollama` + mocked
+  chrome-less, against a real Postgres checkpointer. Happy path,
+  tool-call round-trip, a turn parking on a durable interrupt,
+  deny/allow resume, `edited_args` reaching the tool, an edit still
+  failing the sandbox check, token budget refusal, `<think>` tag
+  splitting, unknown-conversation error.
+- Prompt API: respond/409/400 paths, concurrent responses resolving to
+  one winner, and the pending-prompt listing.
 - Middleware: auth + idempotency + rate-limit end-to-end.
 
 ## Containerization

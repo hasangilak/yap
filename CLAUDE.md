@@ -81,7 +81,15 @@ prepare → callModel → gate → wait → resolvePrompt → execute
 - **`durability: 'sync'`** on every graph call (`turnConfig`). The default `'async'` can lose a checkpoint if the process dies mid-execution — exactly the failure the graph exists to prevent.
 - The façade generator now **ends when the turn pauses**, not only when it completes, because a LangGraph stream terminates at an interrupt. "Generator finished" ≠ "turn finished". The continuation is a separate `resumeTurn()` from whichever endpoint received the answer.
 
-Human input is durable: `POST /approvals/:id/decide` and `POST /clarify/:id/answer` persist the response, then resume the graph thread. **`thread_id` is the assistant node id**, so a decision finds its paused turn from a database row alone — across requests and across restarts. `src/runtime/recovery.ts` runs before `serve()` and reconciles anything left mid-flight: waiting-on-human is left alone, crashed-between-supersteps is replayed with `null` input, and no-checkpoint gets `streaming` cleared plus a terminal `error`.
+Human input is durable and unified: **every pause is a `Prompt` row**, answered through the single `POST /api/v1/prompts/:id/respond`, which persists the response *then* resumes the graph thread. **`thread_id` is the assistant node id**, so a response finds its paused turn from a database row alone — across requests and across restarts. `src/runtime/recovery.ts` runs before `serve()` and reconciles anything left mid-flight: waiting-on-human is left alone, crashed-between-supersteps is replayed with `null` input, and no-checkpoint gets `streaming` cleared plus a terminal `error`.
+
+Three invariants in that endpoint, all load-bearing:
+
+- **Persist before resume.** A response written after the resume could be lost to a crash in between.
+- **The write is a compare-and-set** on `response IS NULL` (`recordPromptResponse` returns whether it claimed the row). A read-then-write check let two concurrent responses both resume the same turn.
+- **The body is validated against the *stored* kind**, so clients don't restate it and a clarify answer posted to an approval prompt is a 400. This is the one endpoint that returns a real 400 on a malformed body — everywhere else `Schema.parse()` throws into Hono and becomes a 500. Don't copy the `.parse()` pattern here.
+
+`edited_args` on an approval response replaces the proposed tool args before `execute` runs (`resolvePromptNode`). It is **not** a trust boundary: `executeTool` validates at execution time, so `write_file`'s sandbox check applies to a human's edit exactly as to a model's proposal — `test/integration/runtime.test.ts` asserts both directions. The in-turn `messages` history deliberately keeps the *original* tool_calls; the node row and event stream carry what actually ran.
 
 The three-layer permission model is unchanged, now in `graph/nodes.ts#isAutoApproved`: session grant (`ApprovalGrant`) → agent `permission_default` → `TOOL_DEFS.auto`.
 
@@ -122,13 +130,17 @@ The `--no-sandbox` patch is applied by `sed` against the vendored fork's build o
 
 All Prisma access goes through **typed wrappers in `src/db/queries.ts`** — one function per logical op. API handlers and the runtime should not call `getPrisma()` directly except in narrow cases (the runtime has one documented façade for clarify JSON). This convention is what makes the DB integration test in `test/integration/db.test.ts` a meaningful contract.
 
-Schema is 15 models in `prisma/schema.prisma`. The tree model: `Conversation` has many `Node`s forming a DAG (`parent_id`) with a pointer to `activeLeaf`; edits create branches rather than mutating.
+Schema is 14 models in `prisma/schema.prisma`. The tree model: `Conversation` has many `Node`s forming a DAG (`parent_id`) with a pointer to `activeLeaf`; edits create branches rather than mutating.
+
+`Prompt` is one row per human pause, replacing the former `Approval` + `Clarify` pair — same mechanic, discriminated by `kind` with the request/response in JSON. `ApprovalGrant` is deliberately *not* folded in: it is a standing permission keyed by (agent, tool) that outlives the turn, not a per-pause record. Note `Node.approval` is vestigial — nothing in the runtime writes it, and only `dev/seed` fixtures populate it; `Node.clarify` is written only *after* an answer. Neither can tell you a prompt is open, which is what `GET /conversations/:id/prompts?pending=true` is for.
 
 `POST /api/v1/dev/seed` (`src/api/dev.ts` + `src/seed/`) idempotently loads the chat-box `SAMPLE_*` fixtures — agents, conversations, and a branched node tree — to bring a fresh DB to a recognizable state. Safe to re-run; every insert is upsert-no-update.
 
 ### Schemas (`src/schemas/`)
 
-Zod schemas mirror `chat-box/src/types.ts` wire types. The `BusEvent` union in `src/events/types.ts` is discriminated on `type` and every variant has round-trip coverage in `test/unit/schemas.test.ts`. When adding a new event type: add the Zod variant, re-export through `events/types.ts`, add a fixture to the schema test, and add the encoder-name mapping in `events/encoder.ts`.
+Zod schemas mirror `chat-box/src/types.ts` wire types. The `BusEvent` union in `src/events/types.ts` is discriminated on **`kind`** and every variant has round-trip coverage in `test/unit/schemas.test.ts`. When adding a new event type: add the Zod variant, re-export through `events/types.ts`, and add a fixture to the schema test. No encoder change is needed — `encodeSSE` reads `ev.kind` directly, so there is no name mapping to maintain.
+
+Where a variant carries kind-specific sub-payloads (`prompt.requested`/`prompt.responded`), nest them under one field as a **discriminated union on an inner tag** rather than as sibling optional fields. Optionals would let a mismatched pair — `prompt_kind: 'approval'` carrying clarify data — parse into a half-populated object; the nested union rejects it and narrows properly in TS. `test/unit/schemas.test.ts` asserts both directions.
 
 ## Conventions
 
@@ -136,7 +148,7 @@ Zod schemas mirror `chat-box/src/types.ts` wire types. The `BusEvent` union in `
 - Prisma runs on `postinstall`, so `@prisma/client` types are always generated after `pnpm install`.
 - Commit message style: short imperative headline with a category prefix (`Testing:`, `API:`, `Runtime:`, `Docs:`, etc.) — follow `git log` for examples. Do not mention Claude/Claude Code in commit messages.
 - `src/ollama-agent.ts` is explicitly labeled "legacy" — it powers the AG-UI `POST /` surface and is stable. Feature work belongs in `src/api/` + `src/runtime/`, not here.
-- **`Phase N` / `PHASE-N:` comments are stale scaffolding, not a roadmap.** Several say things like "Phase 2 will gate these behind an approval round-trip" when approvals already ship (see the `gate`/`wait` nodes in `runtime/graph/nodes.ts`). Trust the code and this file over those markers; delete them when you touch the surrounding lines.
+- **`Phase N` / `PHASE-N:` comments are stale scaffolding, not a roadmap.** They describe work that has since shipped (approvals gate through the `gate`/`wait` nodes in `runtime/graph/nodes.ts`; prompts are unified). Trust the code and this file over those markers; delete them when you touch the surrounding lines.
 - All tunables funnel through `src/config.ts` (env with defaults) — read config there rather than `process.env` at use sites, and document each one in `.env.example`. The only sanctioned exceptions are process-level plumbing that isn't a product knob (`PATH`/`HOME`/`TMPDIR` when building the browser subprocess env) and `test/setup.ts`.
   
 

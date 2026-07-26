@@ -68,31 +68,49 @@ flowchart LR
 **As** a chat-box user **I want** the assistant to ask before running `write_file` **so that** I never silently write files.
 
 - Wire surface:
-  - Incoming: `approval.required` event carries `{ approval_id, tool, preview }`
-  - Outgoing: `POST /api/v1/approvals/:id/decide` with `{ decision: "allow" | "always" | "deny" }`
-  - Follow-up: `approval.decided` event then the tool result events
-- Server path: `api/approvals.ts` + `runtime/run.ts#isAutoApproved` + `runtime/approvals.ts#awaitDecision/resolveApproval`
+  - Incoming: `prompt.requested` with `request.prompt_kind: 'approval'`, carrying `{ prompt_id, tool, request.approval: {title, body, preview} }`
+  - Outgoing: `POST /api/v1/prompts/:id/respond` with `{ decision: "allow" | "always" | "deny" }`
+  - Follow-up: `prompt.responded`, then the tool result events
+- Server path: `api/prompts.ts` + `graph/nodes.ts#isAutoApproved` + the `gate`/`wait`/`resolvePrompt` nodes
 - Permission layers (see `docs/architecture.md` §8): session grant → agent `permission_default` → `TOOL_DEFS.auto` flag.
+- The pause is **durable**: it survives a server restart, so this story has no timeout and the answer can arrive from any later request.
 
-### 1.5 "Allow always" for a tool
+### 1.5 Edit a tool call before approving it
+
+**As** a chat-box user **I want** to fix the path the model chose before letting it write **so that** a nearly-right tool call isn't an all-or-nothing decision.
+
+- Wire surface: `POST /api/v1/prompts/:id/respond` with `{ decision: "allow", edited_args: {...} }`
+- Follow-up: `toolcall.started` carries the **edited** args, and `prompt.responded` echoes `edited_args` so history is accurate about what ran
+- Server path: `graph/nodes.ts#resolvePrompt` swaps `pendingToolCalls[0].args` before `execute`
+- Not a trust boundary: `executeTool` validates at execution time, so `write_file`'s sandbox check applies to an edit exactly as to a model proposal. An edited `../../escape.txt` still fails.
+
+### 1.6 "Allow always" for a tool
 
 **As** a chat-box user **I want** to stop being asked about `web_search` in this conversation **so that** I only approve once.
 
-- Wire surface: `POST /api/v1/approvals/:id/decide` with `{ decision: "always" }` → creates an `ApprovalGrant`
+- Wire surface: `POST /api/v1/prompts/:id/respond` with `{ decision: "always" }` → creates an `ApprovalGrant`
 - Settings: `GET /api/v1/approvals/grants` (list), `DELETE /api/v1/approvals/grants/:key` (revoke)
-- Server path: `api/approvals.ts` — belt-and-braces: both the approvals handler and the runtime write the grant (upsert makes double-write safe).
+- Server path: `api/prompts.ts` — belt-and-braces: both the handler and `resolvePrompt` write the grant (upsert makes the double-write safe). Grants kept their own routes because a grant is a standing permission, not a per-pause record.
 
-### 1.6 Answer a clarifying question
+### 1.7 Answer a clarifying question
 
 **As** a chat-box user **I want** the agent to pause and ask when a request is ambiguous **so that** it doesn't guess and waste a turn.
 
 - Wire surface:
-  - Incoming: `clarify.requested` event carries `{ clarify_id, question, options? }`
-  - Outgoing: `POST /api/v1/clarify/:id/answer` with `{ answer }`
-  - Follow-up: `clarify.answered` event, then the turn resumes
-- Server path: `api/clarify.ts` + `runtime/clarifications.ts#awaitAnswer` — triggered by the `ask_clarification` pseudo-tool the agent can call.
+  - Incoming: `prompt.requested` with `request.prompt_kind: 'clarify'`, carrying `{ prompt_id, request.clarify: {question, chips, input} }`
+  - Outgoing: `POST /api/v1/prompts/:id/respond` with `{ selected_chip_ids, text }` — the same endpoint as an approval
+  - Follow-up: `prompt.responded`, then the turn resumes
+- Server path: `api/prompts.ts` + the same `gate`/`wait`/`resolvePrompt` nodes — triggered by the `ask_clarification` pseudo-tool. It never reaches `executeTool`, so there is no `toolcall.started`/`ended` pair.
 
-### 1.7 Edit a past message
+### 1.8 Recover a prompt after closing the tab
+
+**As** a chat-box user **I want** an open approval to still be there when I come back **so that** a long pause doesn't silently lose my turn.
+
+- Wire surface: `GET /api/v1/conversations/:id/prompts?pending=true` → `PromptRow[]`
+- Server path: `api/prompts.ts` + `db/queries.ts#listPrompts`
+- Why it exists: neither `Node.approval` (never written) nor `Node.clarify` (written only *after* the answer) tells a client that a prompt is open, so the alternative was replaying the whole event log.
+
+### 1.9 Edit a past message
 
 **As** a chat-box user **I want** to revise a question I sent three turns ago **so that** I can explore a different direction without losing the original.
 
@@ -103,21 +121,21 @@ flowchart LR
 - Server path: `api/nodes.ts#edit`
 - Why siblings: original is never mutated — the tree model (see `docs/architecture.md` §7) keeps both branches reachable.
 
-### 1.8 Regenerate an assistant reply
+### 1.10 Regenerate an assistant reply
 
 **As** a chat-box user **I want** to get a different assistant answer to the same question **so that** I can compare options.
 
 - Wire surface: `POST /api/v1/nodes/:id/regenerate` → returns the new placeholder asst node synchronously, streams the rest
 - Server path: `api/nodes.ts#regenerate` → `runtime/run.ts#runAssistantTurn`
 
-### 1.9 Branch mid-conversation
+### 1.11 Branch mid-conversation
 
 **As** a chat-box user **I want** to start a fresh turn from an earlier point **so that** I can ask a different follow-up without losing the current thread.
 
 - Wire surface: `POST /api/v1/nodes/:id/branch` → creates an empty user node on `alt-N`, moves `active_leaf` to it, no generation
 - Server path: `api/nodes.ts#branch`
 
-### 1.10 Prune a dead subtree
+### 1.12 Prune a dead subtree
 
 **As** a chat-box user **I want** to delete an abandoned branch **so that** my tree view stays clean.
 
@@ -125,7 +143,7 @@ flowchart LR
 - Server path: `api/nodes.ts` (delete handler)
 - Safety: if `active_leaf` was inside the subtree, `fallback_leaf` is required or the server returns 409.
 
-### 1.11 Pin snippets and take notes
+### 1.13 Pin snippets and take notes
 
 **As** a chat-box user **I want** to pin useful excerpts and attach a note to the whole thread **so that** I can revisit context quickly.
 
@@ -134,7 +152,7 @@ flowchart LR
   - `POST /api/v1/conversations/:id/pinned` / `GET` / `DELETE /pinned/:pid`
 - Server path: `api/notes.ts`
 
-### 1.12 Tag and filter conversations
+### 1.14 Tag and filter conversations
 
 **As** a chat-box user with many conversations **I want** to tag them **so that** I can filter by topic.
 
@@ -143,28 +161,28 @@ flowchart LR
   - `POST /api/v1/conversations/:id/tags` / `DELETE /tags/:tagId`
 - Server path: `api/tags.ts` + `api/conversations.ts`
 
-### 1.13 Search conversations and messages
+### 1.15 Search conversations and messages
 
 **As** a chat-box user **I want** to grep across everything I've said or the assistant has said **so that** I can find a past answer.
 
 - Wire surface: `GET /api/v1/search?q=…` → highlighted matches across conversations, messages, agents
 - Server path: `api/search.ts` — ILIKE-based; not full-text-indexed yet.
 
-### 1.14 See a timeline of significant events
+### 1.16 See a timeline of significant events
 
 **As** a chat-box user **I want** a compact activity feed for a conversation **so that** I can scan what happened without reading every turn.
 
 - Wire surface: `GET /api/v1/conversations/:id/timeline` → synthesised `TimelineEvent[]`
 - Server path: `api/timeline.ts` — projects over the `events` table.
 
-### 1.15 Export a conversation
+### 1.17 Export a conversation
 
 **As** a chat-box user **I want** to download a conversation as markdown or JSON **so that** I can archive or share it offline.
 
 - Wire surface: `GET /api/v1/conversations/:id/export?format=md|json`
 - Server path: `api/export-share.ts`
 
-### 1.16 Share a read-only link
+### 1.18 Share a read-only link
 
 **As** a chat-box user **I want** to generate a URL anyone can read without an account **so that** I can show off a transcript.
 
@@ -174,7 +192,7 @@ flowchart LR
   - `DELETE /api/v1/shares/:token`
 - Server path: `api/export-share.ts` — `/shared/:token` is the one route deliberately exempt from `bearerAuth`.
 
-### 1.17 Open and diff artifacts (canvas)
+### 1.19 Open and diff artifacts (canvas)
 
 **As** a chat-box user **I want** to see what the agent wrote to disk, with diffs between versions **so that** I can review changes before committing.
 
@@ -184,7 +202,7 @@ flowchart LR
   - `GET /api/v1/artifacts/:id/diff?from=…&to=…`
 - Server path: `api/artifacts.ts` — reads from the `ARTIFACTS_DIR` sandbox; every write produces an `ArtifactVersion`.
 
-### 1.18 Swap agents and inspect versions
+### 1.20 Swap agents and inspect versions
 
 **As** a chat-box user curating agents **I want** to edit an agent's prompt, see version history, diff, and roll back **so that** I can iterate without losing a known-good prompt.
 
@@ -194,14 +212,14 @@ flowchart LR
   - `GET /api/v1/agent-templates` / `POST /api/v1/agent-templates/:id/from`
 - Server path: `api/agents.ts` + `api/agent-templates.ts`
 
-### 1.19 Reconnect without losing events
+### 1.21 Reconnect without losing events
 
 **As** a chat-box user on flaky wifi **I want** to reconnect to the stream and catch up on anything I missed **so that** no events are lost.
 
 - Wire surface: `GET /api/v1/conversations/:id/stream?since_event=<last-event-id>` → replays events with id > cursor, then resumes live
 - Server path: `api/stream.ts` (subscribe-first pattern, see `docs/architecture.md` §5)
 
-### 1.20 Replay an accidental duplicate POST
+### 1.22 Replay an accidental duplicate POST
 
 **As** a chat-box developer writing client retry logic **I want** my `Idempotency-Key` header to return the cached response on retry **so that** retries don't double-send messages.
 
@@ -310,10 +328,10 @@ flowchart LR
 |---|---|---|---|
 | 1.2 | `POST /conversations/:id/messages` + `GET /stream` | `api/messages.ts`, `api/stream.ts`, `runtime/run.ts` | `node.created`, `status.update`, `content.delta`, `node.finalized`, `active_leaf.changed` |
 | 1.3 | `GET /stream` | `runtime/think-splitter.ts` | `reasoning.delta` |
-| 1.4 | `POST /approvals/:id/decide` | `api/approvals.ts`, `runtime/approvals.ts` | `approval.required`, `approval.decided` |
-| 1.6 | `POST /clarify/:id/answer` | `api/clarify.ts`, `runtime/clarifications.ts` | `clarify.requested`, `clarify.answered` |
-| 1.7 | `POST /nodes/:id/edit` | `api/nodes.ts` | `node.created`, `active_leaf.changed`, optional turn events |
-| 1.19 | `GET /stream?since_event=…` | `api/stream.ts` | all persisted events since cursor |
+| 1.4–1.7 | `POST /prompts/:id/respond` | `api/prompts.ts`, `runtime/graph/nodes.ts` (`gate`/`wait`/`resolvePrompt`) | `prompt.requested`, `prompt.responded` |
+| 1.8 | `GET /conversations/:id/prompts?pending=true` | `api/prompts.ts`, `db/queries.ts#listPrompts` | — |
+| 1.9 | `POST /nodes/:id/edit` | `api/nodes.ts` | `node.created`, `active_leaf.changed`, optional turn events |
+| 1.21 | `GET /stream?since_event=…` | `api/stream.ts` | all persisted events since cursor |
 | 2.1 | `POST /` | `ollama-agent.ts`, `server.ts` | AG-UI `TEXT_MESSAGE_*`, `RUN_*` |
 | 3.2 | any `/api/v1/*` | `api/middleware/auth.ts` | — |
 | 3.3 | any `/api/v1/*` | `api/middleware/rate-limit.ts` | — |

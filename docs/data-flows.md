@@ -119,54 +119,61 @@ sequenceDiagram
 
 ---
 
-## 3. Tool call with approval (user says "allow")
+## 3. Tool call needing approval (user says "allow")
 
-Hits the three-layer permission check, sends an `approval.required` event, waits for the user's decision, then resumes.
+Hits the three-layer permission check, raises a `prompt.requested`, and **checkpoints the turn to Postgres**. The graph stream ends here — the continuation is a separate resume from whichever request carries the answer.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor U as chat-box user
-    participant RT as runtime/run.ts
+    participant G as graph/nodes (gate → wait)
+    participant CP as langgraph.checkpoints
     participant DB as Postgres
     participant BUS as events/bus
     participant STR as stream
-    participant APV as runtime/approvals
-    participant API as POST /approvals/:id/decide
+    participant API as POST /prompts/:id/respond
 
-    Note over RT: Ollama returned a tool_call<br/>for `write_file`.
-    RT->>RT: isAutoApproved(agent, tool)?
-    Note over RT: L1 grant: no. L2 agent perm:<br/>ask. L3 auto flag: false.<br/>⇒ must ask.
+    Note over G: model returned a tool_call<br/>for `write_file`.
+    G->>G: isAutoApproved(agent, tool)?
+    Note over G: L1 grant: no. L2 agent perm:<br/>ask. L3 auto flag: false.<br/>⇒ must ask.
 
-    RT->>DB: insertApproval{tool, args, node_id}
-    RT-->>BUS: publish(approval.required)
+    Note over G: `gate` holds every side effect,<br/>because the node containing<br/>interrupt() re-runs on resume.
+    G->>DB: insertPrompt{kind:'approval', tool, payload}
+    G-->>BUS: publish(prompt.requested)
     BUS->>STR: emit
-    STR->>U: data: approval.required {approval_id, preview}
+    STR->>U: event: prompt.requested {prompt_id, request}
 
-    RT->>APV: awaitDecision(approval_id)
-    Note over RT,APV: runtime suspends on<br/>a Promise. Turn is paused.
+    G->>G: `wait` node calls interrupt()
+    G->>CP: checkpoint (durability:'sync')
+    Note over G,CP: The turn is now durable.<br/>The generator ENDS here — a<br/>LangGraph stream terminates at<br/>an interrupt. Survives SIGKILL.
 
-    U->>API: POST /approvals/:id/decide {decision: "allow"}
-    API->>DB: recordApprovalDecision
-    API-->>BUS: publish(approval.decided)
+    U->>API: POST /prompts/:id/respond {decision:"allow", edited_args?}
+    API->>DB: recordPromptResponse (compare-and-set on response IS NULL)
+    Note over API,DB: Persist BEFORE resuming, so an<br/>answer is never lost in between.
+    API-->>U: 200 {ok, resumed: true}
+    API->>CP: resumeTurn(Command{resume: response})
+
+    CP->>G: replay `wait`, then resolvePrompt
+    G-->>BUS: publish(prompt.responded)
     BUS->>STR: emit
-    STR->>U: data: approval.decided
-    API->>APV: resolveApproval(id, "allow")
-    APV-->>RT: resume with "allow"
-    API-->>U: 200 {ok, runtime_awake: true}
-
-    RT->>RT: executeTool("write_file", args)
-    RT->>DB: recordArtifactWrite
-    RT-->>BUS: publish(tool_call with result)
+    STR->>U: event: prompt.responded
+    Note over G: edited_args, if present, replace<br/>the proposed args before execute.
+    G->>G: executeTool("write_file", args)
+    G->>DB: recordArtifactWrite
+    G-->>BUS: publish(toolcall.started / ended, artifact.updated)
     BUS->>STR: emit
-    STR->>U: data: tool_call (completed)
 
-    Note over RT: Feed tool result back into<br/>Ollama, continue the loop.
+    Note over G: Feed tool result back into<br/>the model, continue the loop.
 ```
 
-**"Always" variant.** If the user says `always`, `recordApprovalDecision` also inserts an `ApprovalGrant` row. Next time the same tool is invoked on the same agent, `isAutoApproved` returns true at L1 and the whole approval dance is skipped.
+**"Always" variant.** The endpoint inserts an `ApprovalGrant`, and so does `resolvePrompt` — the upsert makes the double-write a no-op. Next time the same tool is invoked on the same agent, `isAutoApproved` returns true at L1 and the whole round-trip is skipped.
 
-**Runtime-died variant.** If the runtime process crashed between inserting the approval and the user's decision, `resolveApproval` returns `false` (no promise to resolve) — but the `approval.decided` event is still published so the timeline records the decision. A later run that re-reads the approval sees `decision != null` and acts on it.
+**Server-restarted variant.** This is the case the graph exists for. The checkpoint outlives the process, so on boot `runtime/recovery.ts` sees a pending interrupt and leaves the turn alone; the next `POST /prompts/:id/respond` resumes it normally. Verified end-to-end across a `SIGKILL`.
+
+**Nothing-to-resume variant.** If no interrupt is pending (turn already finished, or a checkpoint predating the graph), the endpoint returns `resumed: false` and publishes `prompt.responded` itself so the timeline still records the answer. Not an error.
+
+**Concurrent-response variant.** Two simultaneous responses hit the compare-and-set; exactly one claims the row and resumes, the other gets `409` carrying the winning response.
 
 ---
 
@@ -272,38 +279,41 @@ sequenceDiagram
 
 ## 7. Clarification
 
-The `ask_clarification` pseudo-tool pauses the turn on a `clarify.requested` event. Symmetric to approvals.
+The `ask_clarification` pseudo-tool pauses the turn the same way an approval does — **the same nodes, the same table, the same endpoint**, differing only in `prompt_kind`. That symmetry is why the two collapsed into one prompt model.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor U as user
-    participant RT as runtime
+    participant G as graph/nodes (gate → wait)
+    participant CP as langgraph.checkpoints
     participant DB as Postgres
     participant BUS as bus
     participant STR as stream
-    participant CLC as runtime/clarifications
-    participant API as POST /clarify/:id/answer
+    participant API as POST /prompts/:id/respond
 
-    Note over RT: Model invokes<br/>ask_clarification tool.
-    RT->>DB: insertClarify{question, options?}
-    RT-->>BUS: publish(clarify.requested)
+    Note over G: Model invokes<br/>ask_clarification.
+    Note over G: Not an executable tool — a pause<br/>mechanic. It never reaches<br/>executeTool, so there is no<br/>toolcall.started/ended pair.
+    G->>DB: insertPrompt{kind:'clarify', payload:{question, chips}}
+    G-->>BUS: publish(prompt.requested)
     BUS->>STR: emit
-    STR->>U: data: clarify.requested
-    RT->>CLC: awaitAnswer(clarify_id)
-    Note over RT: turn paused
+    STR->>U: event: prompt.requested {request.prompt_kind:'clarify'}
+    G->>G: `wait` calls interrupt()
+    G->>CP: checkpoint — turn is durable
 
-    U->>API: POST /clarify/:id/answer {answer}
-    API->>DB: recordClarifyResponse
-    API-->>BUS: publish(clarify.answered)
+    U->>API: POST /prompts/:id/respond {selected_chip_ids, text}
+    API->>DB: recordPromptResponse
+    API-->>U: 200 {ok, kind:'clarify', resumed:true}
+    API->>CP: resumeTurn(Command{resume: response})
+
+    CP->>G: resolvePrompt
+    G-->>BUS: publish(prompt.responded)
     BUS->>STR: emit
-    STR->>U: data: clarify.answered
-    API->>CLC: resolveAnswer(id, answer)
-    CLC-->>RT: resume with answer
-    API-->>U: 200
-
-    RT->>RT: feed answer as tool result,<br/>continue loop
+    G->>DB: rewrite Node.clarify with `selected` flags per chip
+    Note over G: Fold the answer into the model's<br/>context as a tool-role message,<br/>continue the loop.
 ```
+
+Note the asymmetry worth knowing: `Node.clarify` *is* written, but only **after** the answer. `Node.approval` is never written at all. Neither tells a client that a prompt is currently open — that is what `GET /conversations/:id/prompts?pending=true` is for.
 
 ---
 
@@ -381,20 +391,23 @@ Identity is the bearer token if set, else the client IP. Two clients can use the
 
 Minimal index; use this when tracing a wire event back to its source.
 
+All 16 kinds, checked against the code. Note almost everything now comes from `graph/nodes.ts` — `runtime/run.ts` is only a façade and emits just the two user-node events before delegating.
+
 | Event `kind` | Emitted by | Context |
 |---|---|---|
-| `node.created` | `runtime/run.ts`, `api/nodes.ts` | New user or asst node inserted |
-| `node.finalized` | `runtime/run.ts` | Asst turn complete, `streaming=false` |
-| `active_leaf.changed` | `runtime/run.ts`, `api/nodes.ts` | Conversation's active leaf moved |
-| `status.update` | `runtime/run.ts` | `thinking` / `streaming` / `tool_use` |
-| `content.delta` | `runtime/run.ts` | Token chunk appended to asst content |
-| `reasoning.delta` | `runtime/run.ts` (via `ThinkSplitter`) | Token chunk inside `<think>` |
-| `approval.required` | `runtime/run.ts` | Tool needs user decision |
-| `approval.decided` | `api/approvals.ts` (also runtime) | Decision recorded; runtime may still be asleep |
-| `clarify.requested` | `runtime/run.ts` | `ask_clarification` tool invoked |
-| `clarify.answered` | `api/clarify.ts` | User answered |
-| `tool_call` | `runtime/run.ts` | Side-effectful tool executed |
-| `artifact.written` | `runtime/run.ts` | `write_file` produced a new version |
-| `error` | `runtime/run.ts` | Budget/deadline/conversation-missing failures |
+| `node.created` | `graph/nodes.ts#prepare` (asst), `runtime/run.ts` (user), `api/nodes.ts` | New node inserted |
+| `node.finalized` | `graph/nodes.ts#finalize` | Asst turn complete, `streaming=false` |
+| `active_leaf.changed` | `graph/nodes.ts#finalize`, `runtime/run.ts`, `api/nodes.ts` | Active leaf moved |
+| `status.update` | `graph/nodes.ts` | `thinking` / `streaming` / `tool` / `approval` |
+| `content.delta` | `graph/nodes.ts#callModel` | Token chunk appended to asst content |
+| `reasoning.delta` | `graph/nodes.ts#callModel` (via `ThinkSplitter`) | Token chunk inside `<think>` |
+| `reasoning.step.end` | `graph/nodes.ts#callModel` | One per closed `</think>` |
+| `toolcall.proposed` | `graph/nodes.ts#gate` | Model asked for a tool, before any gating |
+| `toolcall.started` | `graph/nodes.ts#execute` | Args here are `edited_args` if the user edited |
+| `toolcall.ended` | `graph/nodes.ts#execute`, `#resolvePrompt` (on deny) | Result or error |
+| `prompt.requested` | `graph/nodes.ts#gate` | A human is needed: approval or clarify |
+| `prompt.responded` | `graph/nodes.ts#resolvePrompt`; `api/prompts.ts` only when there is nothing to resume | Answer applied |
+| `artifact.updated` | `graph/nodes.ts#execute` | `write_file` produced a new version |
+| `error` | `graph/nodes.ts`, `runtime/recovery.ts` | Budget/deadline/missing-conversation, or an unrecoverable turn found at boot |
 
-All BusEvents share the envelope `{ id, at, conversation_id, kind, ... }` (see `src/events/types.ts`).
+All BusEvents share the envelope `{ id, at, conversation_id, kind, ... }` (see `src/events/types.ts`), and every one is persisted by `events/bus.ts#publish` **before** being emitted to live subscribers.

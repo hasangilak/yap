@@ -23,7 +23,7 @@ flowchart LR
 
     subgraph Runtime
         OL[(Ollama :11434<br/>local LLM)]
-        PG[(Postgres :5432<br/>15 Prisma models)]
+        PG[(Postgres :5432<br/>14 Prisma models<br/>+ langgraph schema)]
     end
 
     CB -->|REST + SSE<br/>named events| API
@@ -42,7 +42,7 @@ flowchart LR
     class OL,PG runtime
 ```
 
-**Why two surfaces on one port.** `POST /` is a thin stateless bridge (no DB, full history per request — the AG-UI contract). `/api/v1/*` is stateful with persisted trees, approvals, artifacts, etc. They share Ollama + config but **never share middleware** — only `/api/v1/*` gets auth/idempotency/rate-limit.
+**Why two surfaces on one port.** `POST /` is a thin stateless bridge (no DB, full history per request — the AG-UI contract). `/api/v1/*` is stateful with persisted trees, prompts, artifacts, etc. They share Ollama + config but **never share middleware** — only `/api/v1/*` gets auth/idempotency/rate-limit.
 
 ---
 
@@ -71,8 +71,8 @@ flowchart TB
         STRM[stream<br/>SSE + replay]
         NODES[nodes<br/>edit/branch/regen]
         AGENTS[agents + templates]
-        APPR[approvals]
-        CLAR[clarify]
+        PRM[prompts<br/>respond + pending list]
+        APPR[approvals<br/>grants only]
         ART[artifacts]
         TAGS[tags + notes]
         SEARCH[search + timeline]
@@ -80,9 +80,10 @@ flowchart TB
     end
 
     subgraph rt[runtime/]
-        RUN[run.ts<br/>agent loop]
-        APV[approvals.ts<br/>pending-decision coordinator]
-        CLC[clarifications.ts<br/>pending-answer coordinator]
+        RUN[run.ts<br/>façade over the graph]
+        GR[graph/<br/>StateGraph + nodes]
+        CKPT[graph/checkpointer.ts<br/>PostgresSaver]
+        RECOV[recovery.ts<br/>boot reconciliation]
         TS[think-splitter.ts<br/>reasoning parser]
     end
 
@@ -98,19 +99,21 @@ flowchart TB
 
     SRV --> LEG
     SRV --> AUTH --> IDEM --> RL --> APIV1
-    APIV1 --> CONV & MSG & STRM & NODES & AGENTS & APPR & CLAR & ART & TAGS & SEARCH & EXP
+    APIV1 --> CONV & MSG & STRM & NODES & AGENTS & PRM & APPR & ART & TAGS & SEARCH & EXP
     MSG --> RUN
     NODES --> RUN
-    RUN --> APV
-    RUN --> CLC
-    RUN --> TS
-    RUN --> REG
-    CONV & MSG & STRM & NODES & AGENTS & APPR & CLAR & ART & TAGS & SEARCH & EXP --> QRY
-    RUN --> QRY
+    PRM -->|resumeTurn| RUN
+    RUN --> GR
+    GR --> CKPT
+    RECOV --> GR
+    GR --> TS
+    GR --> REG
+    CONV & MSG & STRM & NODES & AGENTS & PRM & APPR & ART & TAGS & SEARCH & EXP --> QRY
+    GR --> QRY
     QRY --> DB
     STRM --> BUS
-    MSG & NODES & APPR & CLAR --> BUS
-    RUN --> BUS
+    MSG & NODES & PRM --> BUS
+    RUN & GR & RECOV --> BUS
     BUS --> ENC
     BUS --> QRY
     APIV1 --> SCH
@@ -126,8 +129,8 @@ flowchart TB
     class SRV entryC
     class LEG,APIV1 surfaceC
     class AUTH,IDEM,RL mwC
-    class CONV,MSG,STRM,NODES,AGENTS,APPR,CLAR,ART,TAGS,SEARCH,EXP routerC
-    class RUN,APV,CLC,TS rtC
+    class CONV,MSG,STRM,NODES,AGENTS,PRM,APPR,ART,TAGS,SEARCH,EXP routerC
+    class RUN,GR,CKPT,RECOV,TS rtC
     class BUS,ENC,TYPES,QRY,DB,SCH,REG dataC
 ```
 
@@ -221,46 +224,44 @@ Any "simplification" that reverses steps 1 and 2 reintroduces the race.
 
 ## 6. Runtime agent loop
 
-`runtime/run.ts` drives each assistant turn as an `AsyncGenerator<BusEvent>`. The loop runs up to `MAX_TOOL_ROUNDS` times per turn.
+The turn is a **LangGraph `StateGraph` checkpointed to Postgres** (`runtime/graph/`). `runtime/run.ts` is only a façade: it keeps the `AsyncGenerator<BusEvent>` signature and re-yields events the graph pushes onto its `custom` stream channel. The loop runs up to `MAX_TOOL_ROUNDS` times per turn.
 
 ```mermaid
 flowchart TB
-    START([runAssistantTurn]) --> BUDGET{token budget<br/>exhausted?}
-    BUDGET -->|yes| ERR[yield error, return]
-    BUDGET -->|no| NODE[insert placeholder<br/>asst node, yield node.created]
-    NODE --> ROUND[round = 0]
-    ROUND --> STREAM[ollama.chat stream]
-    STREAM --> SPLIT[ThinkSplitter<br/>content | reasoning]
-    SPLIT --> YIELD[yield content.delta<br/>/ reasoning.delta / status.update]
-    YIELD --> CHUNKEND{stream<br/>done?}
-    CHUNKEND -->|more chunks| STREAM
-    CHUNKEND -->|done| TC{tool calls<br/>in response?}
-    TC -->|no| FIN[yield node.finalized]
-    FIN --> LEAF[update active_leaf,<br/>yield active_leaf.changed]
-    LEAF --> END([done])
-    TC -->|yes| PERM{auto approved?<br/>grant / agent perm / auto flag}
-    PERM -->|yes| EXEC[executeTool]
-    PERM -->|no| APP[insert Approval,<br/>yield approval.required]
-    APP --> WAIT[awaitDecision promise]
-    WAIT --> DEC{decision}
-    DEC -->|deny| DENIED[append 'denied' tool msg]
-    DEC -->|allow/always| EXEC
+    START([runAssistantTurn]) --> PREP[prepare:<br/>load conv + agent,<br/>insert asst node]
+    PREP --> BUDGET{token budget<br/>exhausted?}
+    BUDGET -->|yes| ERR[emit error] --> FINAL
+    BUDGET -->|no| CM[callModel:<br/>ChatOllama stream]
+    CM --> SPLIT[ThinkSplitter<br/>content vs reasoning]
+    SPLIT --> EMIT[emit content.delta /<br/>reasoning.delta / status.update]
+    EMIT --> TC{tool calls<br/>this round?}
+    TC -->|no| FINAL[finalize:<br/>node.finalized +<br/>active_leaf.changed]
+    FINAL --> END([done])
+    TC -->|yes, round < MAX| GATE[gate: permission check.<br/>ALL side effects live here —<br/>insert Prompt, emit prompt.requested]
+    TC -->|round >= MAX| FINAL
+    GATE -->|auto approved| EXEC
+    GATE -->|needs a human| WAIT[wait: interrupt ONLY.<br/>no side effects, no try/catch]
+    WAIT --> CP[(checkpoint to<br/>langgraph schema)]
+    CP -.->|generator ENDS here| PAUSED([turn parked — durable])
+    PAUSED -.->|POST /prompts/:id/respond<br/>resumes a NEW graph call| RES
+    RES[resolvePrompt:<br/>emit prompt.responded,<br/>apply edited_args] -->|deny| DENIED[append 'denied' tool msg]
+    RES -->|allow/always| EXEC[execute: executeTool,<br/>artifact promotion]
+    RES -->|more prompts queued| GATE
     EXEC --> TRES[append tool result msg]
-    TRES --> NEXT{round <<br/>MAX_TOOL_ROUNDS?}
-    TRES --> DENIED
-    DENIED --> NEXT
-    NEXT -->|yes| ROUND
-    NEXT -->|no| CAP[yield error<br/>'max tool rounds']
-    CAP --> END
+    TRES --> CM
+    DENIED --> CM
 
-    classDef boundary fill:#fff3e0,stroke:#e65100
     classDef decision fill:#e1f5fe,stroke:#0277bd
     classDef io fill:#e8f5e9,stroke:#2e7d32
-    class BUDGET,CHUNKEND,TC,PERM,DEC,NEXT decision
-    class STREAM,EXEC,APP,WAIT,NODE,FIN,LEAF,YIELD,SPLIT io
+    classDef pause fill:#fff3e0,stroke:#e65100
+    class BUDGET,TC decision
+    class CM,EXEC,GATE,PREP,FINAL,EMIT,SPLIT,RES io
+    class WAIT,CP,PAUSED pause
 ```
 
-**Why the coordinator pattern.** `awaitDecision` and `awaitAnswer` are in-process promises. The HTTP handler for `POST /approvals/:id/decide` calls `resolveApproval(id, decision)` which fulfills the runtime's promise and lets the generator continue. This is why yap is single-instance by design — if you need multi-process, the coordinators have to move to a durable store.
+**Why `gate` and `wait` are separate nodes.** A node containing `interrupt()` **re-executes from the top on resume**. If the side effects sat next to the `interrupt()`, every resume would insert a second prompt row and re-emit `prompt.requested`. So `gate` holds everything with an effect and `wait` contains nothing but the call. Two related rules: `interrupt()` propagates by *throwing* `GraphInterrupt`, so `wait` must never sit inside a `try/catch` (the pre-graph loop wrapped a whole round in one, which would turn every pause into a failed turn); and interrupts must never be raised in a loop over a dynamic list, so tool calls are gated one per `gate`/`wait` pass with a conditional edge looping back.
+
+**Why the pause is durable now.** It used to be an in-process promise, so a restart destroyed the turn permanently — the prompt row stayed unanswered, the node stayed `streaming: true`, and nothing revisited it. Now the pause is a checkpoint row written with `durability: 'sync'`, and `thread_id` is the assistant node id, so a response finds its paused turn from a database row alone. `runtime/recovery.ts` runs before `serve()` and reconciles whatever was mid-flight. Note the consequence for callers: **the generator ends when the turn pauses**, not only when it completes — "generator finished" ≠ "turn finished".
 
 ---
 
@@ -300,7 +301,7 @@ Operations in `api/nodes.ts`:
 
 ## 8. Three-layer permission model for tools
 
-Checked in `runtime/run.ts#isAutoApproved`, in this precedence:
+Checked in `runtime/graph/nodes.ts#isAutoApproved`, in this precedence:
 
 ```mermaid
 flowchart TD
@@ -312,9 +313,11 @@ flowchart TD
     L2 -->|ask / side-effect| L3
     L3{Layer 3:<br/>TOOL_DEFS.auto flag}
     L3 -->|true & side-effect-free| AUTO
-    L3 -->|false or side-effect| ASK[insert Approval<br/>yield approval.required<br/>await user decision]
-    ASK --> DEC{user decides}
+    L3 -->|false or side-effect| ASK[insert Prompt,<br/>emit prompt.requested,<br/>checkpoint and park]
+    ASK --> DEC{POST /prompts/:id/respond}
     DEC -->|allow| AUTO
+    DEC -->|allow + edited_args| EDIT[swap in the human's args,<br/>then execute]
+    EDIT --> AUTO
     DEC -->|always| GRANT[insertGrant → Layer 1<br/>becomes yes next time]
     GRANT --> AUTO
     DEC -->|deny| DENY[append denied tool msg,<br/>continue loop]
@@ -322,12 +325,14 @@ flowchart TD
     classDef ok fill:#c8e6c9,stroke:#2e7d32
     classDef ask fill:#fff9c4,stroke:#f57f17
     classDef deny fill:#ffcdd2,stroke:#c62828
-    class AUTO,GRANT ok
+    class AUTO,GRANT,EDIT ok
     class ASK,DEC ask
     class DENY deny
 ```
 
 `isSideEffectful(toolName)` comes from `registry/tools.ts`. `write_file`, `run_tests`, and any tool with mutating intent are side-effectful; `read_file`, `web_search`, `ask_clarification` are not.
+
+**`edited_args` is not a fourth layer.** Letting a human rewrite the arguments does not widen what a tool may do: `executeTool` validates at execution time, so `write_file`'s two-layer sandbox check applies identically to a human's edit and a model's proposal. The permission model gates *whether* the call runs; the tool implementation gates *what it may touch*. Keep those separate — moving path validation up to proposal time would make edited args a bypass.
 
 ---
 
