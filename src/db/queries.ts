@@ -110,6 +110,9 @@ type ConvRow = {
   tokenBudget: number;
   tokensUsed: number;
   shareToken: string | null;
+  tags?: Array<{
+    tag: { id: string; name: string; color: string | null };
+  }>;
 };
 
 function convRowToWire(row: ConvRow, agentName: string): Conversation {
@@ -119,6 +122,11 @@ function convRowToWire(row: ConvRow, agentName: string): Conversation {
     snippet: row.snippet,
     agent: agentName,
     tag: row.tag ?? '',
+    tags: (row.tags ?? []).map(({ tag }) => ({
+      id: tag.id,
+      name: tag.name,
+      color: tag.color,
+    })),
     ...(row.pinned ? { pinned: true } : {}),
     updated: formatDisplayTime(row.updatedAt),
     folder: row.pinned ? 'Pinned' : bucketByDate(row.updatedAt),
@@ -187,6 +195,7 @@ export async function updateConversationPointers(
 export async function listConversations(): Promise<Conversation[]> {
   const rows = await getPrisma().conversation.findMany({
     orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
+    include: { tags: { include: { tag: true } } },
   });
   const agentIds = [...new Set(rows.map((r) => r.agentId))];
   const agents = await getPrisma().agent.findMany({
@@ -198,7 +207,10 @@ export async function listConversations(): Promise<Conversation[]> {
 }
 
 export async function getConversation(id: string): Promise<Conversation | null> {
-  const row = await getPrisma().conversation.findUnique({ where: { id } });
+  const row = await getPrisma().conversation.findUnique({
+    where: { id },
+    include: { tags: { include: { tag: true } } },
+  });
   if (!row) return null;
   const agent = await getPrisma().agent.findUnique({
     where: { id: row.agentId },

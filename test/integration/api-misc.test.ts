@@ -61,6 +61,16 @@ describe('tools + tags', () => {
     await expectOk(
       await jsonReq(app, 'POST', '/api/v1/conversations/c-1/tags', { tag_id: t.id }),
     );
+    const list = (await expectOk(
+      await jsonReq(app, 'GET', '/api/v1/conversations'),
+    )) as Array<{ id: string; tags: Array<{ id: string; name: string }> }>;
+    expect(list.find((conversation) => conversation.id === 'c-1')?.tags).toEqual([
+      { id: t.id, name: 'urgent', color: '#f00' },
+    ]);
+    const detail = (await expectOk(
+      await jsonReq(app, 'GET', '/api/v1/conversations/c-1'),
+    )) as { conversation: { tags: Array<{ id: string }> } };
+    expect(detail.conversation.tags).toMatchObject([{ id: t.id }]);
     const dup = await jsonReq(app, 'POST', '/api/v1/tags', { name: 'urgent' });
     expect(dup.status).toBe(409);
     await expectOk(

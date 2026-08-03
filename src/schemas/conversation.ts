@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { TagSchema } from './misc.js';
 
 export const ConversationSchema = z.object({
   id: z.string(),
@@ -6,6 +7,7 @@ export const ConversationSchema = z.object({
   snippet: z.string(),
   agent: z.string(),
   tag: z.string(),
+  tags: z.array(TagSchema),
   pinned: z.boolean().optional(),
   updated: z.string(),
   folder: z.string(),
