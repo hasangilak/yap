@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { config } from '../../src/config.js';
 import {
+  inspectLinkedWorkspace,
   readWorkspaceFile,
   runWorkspaceTests,
 } from '../../src/tools/workspace.js';
@@ -43,6 +44,10 @@ describe('linked workspace tools', () => {
   });
 
   it('reads a relative file inside the linked root', async () => {
+    expect(inspectLinkedWorkspace()).toEqual({
+      readable: true,
+      hasTestScript: true,
+    });
     await expect(readWorkspaceFile('inside.txt')).resolves.toBe(
       'workspace contents',
     );

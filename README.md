@@ -142,7 +142,7 @@ Copy `.env.example` to `.env` and tweak. All vars optional:
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
 | `MODEL` | `qwen2.5:14b` | Default model |
 | `ARTIFACTS_DIR` | `../artifacts` | `write_file` sandbox root |
-| `WORKSPACE_DIR` | *(empty)* | Trusted project root; enables `read_file` and approval-gated `run_tests` |
+| `WORKSPACE_DIR` | *(empty)* | Trusted project root; enables `read_file`, plus approval-gated `run_tests` when `scripts.test` exists |
 | `WORKSPACE_READ_MAX_BYTES` | `200000` | Maximum file size returned by `read_file` |
 | `WORKSPACE_TEST_TIMEOUT_MS` | `120000` | Hard timeout for the linked package test script |
 | `WORKSPACE_TEST_MAX_OUTPUT_BYTES` | `200000` | Maximum captured stdout/stderr from tests |

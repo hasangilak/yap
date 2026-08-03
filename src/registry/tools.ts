@@ -3,10 +3,14 @@ import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import type { Tool } from 'ollama';
 import { config } from '../config.js';
 import { webSearch } from '../tools/browser.js';
-import { readWorkspaceFile, runWorkspaceTests } from '../tools/workspace.js';
+import {
+  inspectLinkedWorkspace,
+  readWorkspaceFile,
+  runWorkspaceTests,
+} from '../tools/workspace.js';
 import type { ToolDef } from '../schemas/index.js';
 
-const workspaceLinked = config.workspaceDir !== null;
+const workspace = inspectLinkedWorkspace();
 
 /**
  * The process-scoped tool registry. Shapes match chat-box's SAMPLE_TOOLS:
@@ -19,10 +23,10 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'read_file',
     name: 'read_file',
-    desc: workspaceLinked
+    desc: workspace.readable
       ? 'Read a UTF-8 file from the linked workspace.'
       : 'Read a file from the linked repo. Unavailable until WORKSPACE_DIR is set.',
-    enabled: workspaceLinked,
+    enabled: workspace.readable,
     auto: false,
   },
   {
@@ -35,11 +39,11 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'run_tests',
     name: 'run_tests',
-    desc: workspaceLinked
+    desc: workspace.hasTestScript
       ? 'Execute the linked workspace package test script. Requires approval.'
-      : 'Execute the test suite. Unavailable until WORKSPACE_DIR is set.',
-    enabled: workspaceLinked,
-    auto: workspaceLinked,
+      : 'Execute the test suite. Unavailable until the linked package declares scripts.test.',
+    enabled: workspace.hasTestScript,
+    auto: workspace.hasTestScript,
   },
   {
     id: 'web_search',

@@ -1,10 +1,38 @@
 import { execFile } from 'node:child_process';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { access, readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { config } from '../config.js';
 
 const execFileAsync = promisify(execFile);
+
+export function inspectLinkedWorkspace(): {
+  readable: boolean;
+  hasTestScript: boolean;
+} {
+  if (!config.workspaceDir) return { readable: false, hasTestScript: false };
+  try {
+    const root = realpathSync(config.workspaceDir);
+    if (!statSync(root).isDirectory()) {
+      return { readable: false, hasTestScript: false };
+    }
+    try {
+      const pkg = JSON.parse(
+        readFileSync(resolve(root, 'package.json'), 'utf8'),
+      ) as { scripts?: { test?: unknown } };
+      return {
+        readable: true,
+        hasTestScript:
+          typeof pkg.scripts?.test === 'string' && !!pkg.scripts.test.trim(),
+      };
+    } catch {
+      return { readable: true, hasTestScript: false };
+    }
+  } catch {
+    return { readable: false, hasTestScript: false };
+  }
+}
 
 async function linkedWorkspaceRoot(): Promise<string> {
   if (!config.workspaceDir) {
