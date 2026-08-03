@@ -52,6 +52,63 @@ describe('GET /api/v1/conversations', () => {
     )) as Array<{ id: string }>;
     expect(rows.map((r) => r.id)).toEqual(['c-2', 'c-0', 'c-1']);
   });
+
+  it('filters by text, attached tag, folder, and pinned state', async () => {
+    await seed();
+    const now = Date.now();
+    await insertConversation({
+      id: 'c-pinned',
+      title: 'Pinned reference',
+      agent_id: 'a-1',
+      tag: 'legacy',
+      pinned: true,
+      updated_at: new Date(now),
+    });
+    await insertConversation({
+      id: 'c-week',
+      title: 'Needle planning',
+      agent_id: 'a-1',
+      updated_at: new Date(now - 2 * 86_400_000),
+    });
+    await insertConversation({
+      id: 'c-old',
+      title: 'Archive',
+      agent_id: 'a-1',
+      updated_at: new Date(now - 8 * 86_400_000),
+    });
+    const tag = (await expectOk(
+      await jsonReq(app, 'POST', '/api/v1/tags', { name: 'urgent' }),
+    )) as { id: string };
+    await expectOk(
+      await jsonReq(app, 'POST', '/api/v1/conversations/c-week/tags', {
+        tag_id: tag.id,
+      }),
+    );
+
+    const idsFor = async (query: string) => {
+      const rows = (await expectOk(
+        await jsonReq(app, 'GET', `/api/v1/conversations?${query}`),
+      )) as Array<{ id: string }>;
+      return rows.map((row) => row.id);
+    };
+
+    await expect(idsFor('q=needle')).resolves.toEqual(['c-week']);
+    await expect(idsFor('tag=urgent')).resolves.toEqual(['c-week']);
+    await expect(idsFor('tag=legacy')).resolves.toEqual(['c-pinned']);
+    await expect(idsFor('folder=This%20week')).resolves.toEqual(['c-week']);
+    await expect(idsFor('folder=Earlier')).resolves.toEqual(['c-old']);
+    await expect(idsFor('pinned=true')).resolves.toEqual(['c-pinned']);
+    await expect(idsFor('pinned=false')).resolves.toEqual(['c-week', 'c-old']);
+  });
+
+  it('rejects invalid filter values', async () => {
+    const response = await jsonReq(
+      app,
+      'GET',
+      '/api/v1/conversations?pinned=sometimes',
+    );
+    expect(response.status).toBe(400);
+  });
 });
 
 describe('POST /api/v1/conversations', () => {

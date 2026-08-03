@@ -193,8 +193,54 @@ export async function updateConversationPointers(
   });
 }
 
-export async function listConversations(): Promise<Conversation[]> {
+export interface ConversationFilters {
+  q?: string;
+  tag?: string;
+  folder?: 'Pinned' | 'Today' | 'This week' | 'Earlier';
+  pinned?: boolean;
+}
+
+export async function listConversations(
+  filters: ConversationFilters = {},
+): Promise<Conversation[]> {
+  const and: Prisma.ConversationWhereInput[] = [];
+  if (filters.q) {
+    and.push({
+      OR: [
+        { title: { contains: filters.q, mode: 'insensitive' } },
+        { snippet: { contains: filters.q, mode: 'insensitive' } },
+      ],
+    });
+  }
+  if (filters.tag) {
+    and.push({
+      OR: [
+        { tag: filters.tag },
+        { tags: { some: { tag: { name: filters.tag } } } },
+      ],
+    });
+  }
+  if (filters.pinned !== undefined) and.push({ pinned: filters.pinned });
+  if (filters.folder) {
+    const now = Date.now();
+    const oneDayAgo = new Date(now - 86_400_000);
+    const oneWeekAgo = new Date(now - 7 * 86_400_000);
+    if (filters.folder === 'Pinned') and.push({ pinned: true });
+    if (filters.folder === 'Today') {
+      and.push({ pinned: false, updatedAt: { gte: oneDayAgo } });
+    }
+    if (filters.folder === 'This week') {
+      and.push({
+        pinned: false,
+        updatedAt: { gte: oneWeekAgo, lt: oneDayAgo },
+      });
+    }
+    if (filters.folder === 'Earlier') {
+      and.push({ pinned: false, updatedAt: { lt: oneWeekAgo } });
+    }
+  }
   const rows = await getPrisma().conversation.findMany({
+    where: and.length > 0 ? { AND: and } : undefined,
     orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
     include: { tags: { include: { tag: true } } },
   });

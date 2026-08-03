@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
+import { z } from 'zod';
 import { getPrisma } from '../db/index.js';
 import {
   firstAgentId,
@@ -13,6 +14,16 @@ import { AttachTagRequestSchema, CreateConversationRequestSchema } from '../sche
 
 export const conversationsRouter = new Hono();
 
+const ListConversationsQuerySchema = z.object({
+  q: z.string().trim().min(1).optional(),
+  tag: z.string().trim().min(1).optional(),
+  folder: z.enum(['Pinned', 'Today', 'This week', 'Earlier']).optional(),
+  pinned: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .optional(),
+});
+
 async function resolveAgentId(input: string | undefined): Promise<string | null> {
   if (!input) return firstAgentId();
   // chat-box's Conversation.agent is a display name. Accept either a
@@ -24,7 +35,13 @@ async function resolveAgentId(input: string | undefined): Promise<string | null>
 }
 
 conversationsRouter.get('/', async (c) => {
-  const rows = await listConversations();
+  const filters = ListConversationsQuerySchema.parse({
+    q: c.req.query('q'),
+    tag: c.req.query('tag'),
+    folder: c.req.query('folder'),
+    pinned: c.req.query('pinned'),
+  });
+  const rows = await listConversations(filters);
   return c.json(rows);
 });
 
