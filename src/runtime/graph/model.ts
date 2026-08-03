@@ -123,10 +123,14 @@ export function parseTextualWebSearchCall(content: string): NormalizedToolCall |
   );
   if (functionCall?.[1]) {
     const quoted = functionCall[1];
-    const query = quoted.startsWith('"')
-      ? String(JSON.parse(quoted))
-      : quoted.slice(1, -1);
-    if (query.trim()) return { name: 'web_search', args: { query: query.trim() } };
+    try {
+      const query = quoted.startsWith('"')
+        ? String(JSON.parse(quoted))
+        : quoted.slice(1, -1);
+      if (query.trim()) return { name: 'web_search', args: { query: query.trim() } };
+    } catch {
+      // Invalid quoting is model prose, not an executable request.
+    }
   }
 
   for (let start = 0; start < content.length; start++) {

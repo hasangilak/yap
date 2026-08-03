@@ -27,6 +27,7 @@ describe('textual web-search fallback', () => {
 
   it('leaves ordinary prose and malformed calls alone', () => {
     expect(parseTextualWebSearchCall('You can call web_search when needed.')).toBeNull();
+    expect(parseTextualWebSearchCall('web_search("bad\\qescape")')).toBeNull();
     expect(parseTextualWebSearchCall('{ "name": "web_search", "arguments": {} }')).toBeNull();
   });
 });
