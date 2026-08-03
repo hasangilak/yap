@@ -80,6 +80,15 @@ describe('tools + tags', () => {
     const gone = await jsonReq(app, 'DELETE', `/api/v1/conversations/c-1/tags/${t.id}`);
     expect(gone.status).toBe(404);
   });
+
+  it('returns a structured 400 for an invalid request body', async () => {
+    const response = await jsonReq(app, 'POST', '/api/v1/tags', { name: '' });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: 'invalid request',
+      issues: [{ path: 'name' }],
+    });
+  });
 });
 
 describe('notes + pinned snippets', () => {

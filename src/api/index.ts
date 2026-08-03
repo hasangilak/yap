@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { ZodError } from 'zod';
 import { agentsRouter } from './agents.js';
 import { templatesRouter } from './agent-templates.js';
 import { approvalsRouter } from './approvals.js';
@@ -19,6 +20,22 @@ import { timelineRouter } from './timeline.js';
 import { toolsRouter } from './tools.js';
 
 export const apiV1 = new Hono();
+
+apiV1.onError((error, c) => {
+  if (error instanceof ZodError) {
+    return c.json(
+      {
+        error: 'invalid request',
+        issues: error.issues.map((issue) => ({
+          path: issue.path.join('.'),
+          message: issue.message,
+        })),
+      },
+      400,
+    );
+  }
+  throw error;
+});
 
 // Write/stream routes reference :id under /conversations and so mount at
 // the v1 root; Hono's route matcher handles the overlap.
