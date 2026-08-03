@@ -151,8 +151,15 @@ describe('search', () => {
   it('matches messages and highlights the needle', async () => {
     const r = (await expectOk(
       await jsonReq(app, 'GET', '/api/v1/search?q=idempotency&scope=messages'),
-    )) as { hits: Array<{ snippet: string; highlight: string }> };
+    )) as {
+      hits: Array<{
+        conversation_id: string;
+        snippet: string;
+        highlight: string;
+      }>;
+    };
     expect(r.hits.length).toBeGreaterThan(0);
+    expect(r.hits[0]!.conversation_id).toBe('c-1');
     expect(r.hits[0]!.highlight).toMatch(/\*\*idempotency\*\*|\*\*Idempotency\*\*/i);
   });
 

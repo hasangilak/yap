@@ -73,6 +73,8 @@ export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 export const SearchHitSchema = z.object({
   scope: z.enum(['conversations', 'messages', 'agents']),
   id: z.string(),
+  /** Owning conversation for navigable hits; null for agent results. */
+  conversation_id: z.string().nullable(),
   title: z.string(),
   snippet: z.string(),
   highlight: z.string(),

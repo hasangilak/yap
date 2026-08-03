@@ -57,6 +57,7 @@ searchRouter.get('/', async (c) => {
       hits.push({
         scope: 'conversations',
         id: r.id,
+        conversation_id: r.id,
         title: r.title,
         snippet: contextSnippet(source, q),
         highlight: boldMatch(contextSnippet(source, q), q),
@@ -75,6 +76,7 @@ searchRouter.get('/', async (c) => {
       hits.push({
         scope: 'messages',
         id: r.id,
+        conversation_id: r.conversationId,
         title: `${r.role === 'asst' ? 'Assistant' : 'User'} in ${r.conversationId}`,
         snippet: contextSnippet(r.content, q),
         highlight: boldMatch(contextSnippet(r.content, q), q),
@@ -106,6 +108,7 @@ searchRouter.get('/', async (c) => {
       hits.push({
         scope: 'agents',
         id: r.id,
+        conversation_id: null,
         title: r.name,
         snippet: contextSnippet(source, q),
         highlight: boldMatch(contextSnippet(source, q), q),
