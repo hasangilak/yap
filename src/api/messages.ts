@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import { getConversationRaw } from '../db/queries.js';
 import { publish } from '../events/bus.js';
 import { runAgent } from '../runtime/run.js';
+import { maybeNameConversation } from '../runtime/conversation-title.js';
+import { envelope } from '../runtime/graph/emit.js';
 import { PostMessageRequestSchema } from '../schemas/index.js';
 
 export const messagesRouter = new Hono();
@@ -51,13 +53,34 @@ messagesRouter.post('/conversations/:id/messages', async (c) => {
   // the event stream (runtime yields `error` events) so logging here
   // is a last-resort net.
   (async () => {
-    try {
-      for await (const ev of generator) {
-        await publish(ev);
+    const drainTurn = async () => {
+      try {
+        for await (const ev of generator) await publish(ev);
+      } catch (err) {
+        console.error('[runtime] unhandled:', err);
       }
-    } catch (err) {
-      console.error('[runtime] unhandled:', err);
-    }
+    };
+    const nameConversation = async () => {
+      // The request began while the conversation was empty. The conditional DB
+      // update inside maybeNameConversation protects explicit or concurrent
+      // renames while this model call is in flight.
+      if (conv.rootNodeId !== null) return;
+      try {
+        const title = await maybeNameConversation(id, body.content);
+        if (title) {
+          await publish({
+            kind: 'conversation.title.updated',
+            ...envelope(id),
+            title,
+          });
+        }
+      } catch (err) {
+        // Naming is enrichment: it must never interrupt the assistant turn.
+        console.error('[conversation-title] unhandled:', err);
+      }
+    };
+
+    await Promise.all([drainTurn(), nameConversation()]);
   })();
 
   return c.json(userNode, 201);

@@ -11,6 +11,7 @@ import {
   listConversations,
 } from '../db/queries.js';
 import { AttachTagRequestSchema, CreateConversationRequestSchema } from '../schemas/index.js';
+import { DEFAULT_CONVERSATION_TITLE } from '../runtime/conversation-title.js';
 
 export const conversationsRouter = new Hono();
 
@@ -54,7 +55,7 @@ conversationsRouter.post('/', async (c) => {
   const id = `c-${randomUUID().slice(0, 8)}`;
   await insertConversation({
     id,
-    title: body.title ?? 'New conversation',
+    title: body.title ?? DEFAULT_CONVERSATION_TITLE,
     agent_id: agentId,
   });
   const conv = await getConversation(id);

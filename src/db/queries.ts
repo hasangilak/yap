@@ -193,6 +193,22 @@ export async function updateConversationPointers(
   });
 }
 
+/**
+ * Replace the placeholder title once, without racing a user or another naming
+ * request that changed it while the model was generating a suggestion.
+ */
+export async function updateConversationTitleIfCurrent(
+  id: string,
+  currentTitle: string,
+  title: string,
+): Promise<boolean> {
+  const result = await getPrisma().conversation.updateMany({
+    where: { id, title: currentTitle },
+    data: { title },
+  });
+  return result.count === 1;
+}
+
 export interface ConversationFilters {
   q?: string;
   tag?: string;

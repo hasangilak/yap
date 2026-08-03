@@ -1017,6 +1017,11 @@ interface ActiveLeafChangedEvent extends BaseEvent {
   active_leaf_id: string;     // no node_id field on this one
 }
 
+interface ConversationTitleUpdatedEvent extends BaseEvent {
+  kind: 'conversation.title.updated';
+  title: string;              // generated once from the first user message
+}
+
 interface ErrorEvent extends BaseEvent {
   kind: 'error';
   node_id?: string;

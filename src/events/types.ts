@@ -15,6 +15,7 @@ export {
   TurnCancelledEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
+  ConversationTitleUpdatedEventSchema,
   ErrorEventSchema,
 } from '../schemas/events.js';
 

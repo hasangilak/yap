@@ -81,6 +81,11 @@ export const ActiveLeafChangedEventSchema = Base.extend({
   active_leaf_id: z.string(),
 });
 
+export const ConversationTitleUpdatedEventSchema = Base.extend({
+  kind: z.literal('conversation.title.updated'),
+  title: z.string().min(1),
+});
+
 // -- prompts (the unified human-in-the-loop pause) ----------------------------
 
 /**
@@ -218,6 +223,7 @@ export const BusEventSchema = z.discriminatedUnion('kind', [
   ArtifactUpdatedEventSchema,
   NodeFinalizedEventSchema,
   ActiveLeafChangedEventSchema,
+  ConversationTitleUpdatedEventSchema,
   ErrorEventSchema,
 ]);
 export type BusEvent = z.infer<typeof BusEventSchema>;
