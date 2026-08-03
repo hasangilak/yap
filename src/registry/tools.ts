@@ -15,8 +15,8 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'read_file',
     name: 'read_file',
-    desc: 'Read a file from the linked repo.',
-    enabled: true,
+    desc: 'Read a file from the linked repo. Unavailable until a workspace is linked.',
+    enabled: false,
     auto: false,
   },
   {
@@ -29,9 +29,9 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'run_tests',
     name: 'run_tests',
-    desc: 'Execute the test suite; returns pass/fail + logs.',
-    enabled: true,
-    auto: true,
+    desc: 'Execute the test suite. Unavailable until a workspace is linked.',
+    enabled: false,
+    auto: false,
   },
   {
     id: 'web_search',
@@ -65,8 +65,8 @@ export const TOOL_DEFS: ToolDef[] = [
 
 /**
  * Ollama function-calling schemas injected into chat() so the model can
- * request a tool. Only read-only tools with a real Phase 1 implementation
- * are advertised — side-effect tools live in Phase 2.
+ * request a tool. Only executable tools are advertised; clarification is a
+ * runtime control tool and therefore does not appear in the client catalog.
  */
 export const OLLAMA_TOOLS: Tool[] = [
   {
@@ -136,6 +136,15 @@ export const OLLAMA_TOOLS: Tool[] = [
   },
 ];
 
+const enabledAgentToolIds = new Set(
+  TOOL_DEFS.filter((tool) => tool.enabled).map((tool) => tool.id),
+);
+
+/** Remove unknown and unavailable tools while preserving selection order. */
+export function filterEnabledToolIds(toolIds: string[]): string[] {
+  return [...new Set(toolIds.filter((id) => enabledAgentToolIds.has(id)))];
+}
+
 export interface ToolExecResult {
   status: 'ok' | 'err';
   elapsed_ms: number;
@@ -144,10 +153,9 @@ export interface ToolExecResult {
 }
 
 /**
- * Dispatch a tool call. Phase 1 implements web_search only; every other
- * tool returns a clear not-implemented error so the model can recover.
- * PHASE-2: side-effect tools (write_file, run_tests, send_email) must
- * route through approval before reaching this function.
+ * Dispatch a tool call. Executable side-effect tools route through approval
+ * before reaching this function; unknown or unavailable tools return a clear
+ * error so a stale model response can recover.
  */
 export async function executeTool(
   name: string,

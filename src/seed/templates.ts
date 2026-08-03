@@ -51,7 +51,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
       variables: [
         { name: 'warehouse', default: 'analytics.prod', description: 'Primary SQL warehouse schema.' },
       ],
-      tool_ids: ['sql_query', 'web_search'],
+      tool_ids: ['web_search'],
       permission_default: 'auto_allow_read',
       message: 'Created from starter template: data-analyst',
     },
@@ -71,7 +71,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
       system_prompt:
         'You are a senior code reviewer. For every diff, produce: (1) one-line summary, (2) bugs found, (3) style/idiom notes, (4) tests missing. Be direct. Ask for context only when truly blocking.',
       variables: [],
-      tool_ids: ['read_file', 'run_tests'],
+      tool_ids: [],
       permission_default: 'ask_every_time',
       message: 'Created from starter template: code-reviewer',
     },
@@ -91,7 +91,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
       system_prompt:
         'You are a research assistant. When asked a question, search the web broadly, read the top 3-5 sources, and synthesize a compact answer that names each source inline. Surface conflicts rather than averaging them.',
       variables: [],
-      tool_ids: ['web_search', 'web_fetch'],
+      tool_ids: ['web_search'],
       permission_default: 'auto_allow_read',
       message: 'Created from starter template: researcher',
     },

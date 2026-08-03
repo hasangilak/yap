@@ -29,6 +29,14 @@ describe('agents CRUD', () => {
     expect(a.temperature).toBe(0.3);
   });
 
+  it('drops unknown and unavailable tool selections', async () => {
+    const agent = (await createAgent({
+      name: 'Tool user',
+      tool_ids: ['read_file', 'web_search', 'nope', 'web_search'],
+    })) as unknown as { tool_ids: string[] };
+    expect(agent.tool_ids).toEqual(['web_search']);
+  });
+
   it('GET /agents returns thin 7-field wire shape (not current_version_id)', async () => {
     await createAgent({ name: 'X' });
     const list = (await expectOk(

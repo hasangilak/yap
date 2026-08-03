@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { getPrisma } from './index.js';
+import { filterEnabledToolIds } from '../registry/tools.js';
 import type {
   Agent,
   AgentFull,
@@ -450,7 +451,7 @@ export async function createAgent(input: CreateAgentInput): Promise<AgentFull> {
     max_tokens: input.max_tokens ?? 4096,
     system_prompt: input.system_prompt ?? '',
     variables: input.variables ?? [],
-    tool_ids: input.tool_ids ?? [],
+    tool_ids: filterEnabledToolIds(input.tool_ids ?? []),
     permission_default: input.permission_default ?? 'ask_every_time',
     current_version_id: versionId,
   };
@@ -535,7 +536,7 @@ export async function patchAgent(
       ...(patch.max_tokens !== undefined ? { max_tokens: patch.max_tokens } : {}),
       ...(patch.system_prompt !== undefined ? { system_prompt: patch.system_prompt } : {}),
       ...(patch.variables !== undefined ? { variables: patch.variables } : {}),
-      ...(patch.tool_ids !== undefined ? { tool_ids: patch.tool_ids } : {}),
+      tool_ids: filterEnabledToolIds(patch.tool_ids ?? current.tool_ids),
       ...(patch.permission_default !== undefined
         ? { permission_default: patch.permission_default }
         : {}),
@@ -658,13 +659,16 @@ type AgentRow = {
 };
 
 function agentRowToWire(row: AgentRow): Agent {
+  const toolIds = Array.isArray(row.toolIds)
+    ? row.toolIds.filter((id): id is string => typeof id === 'string')
+    : [];
   return {
     id: row.id,
     name: row.name,
     initial: row.initial,
     desc: row.description,
     model: row.model,
-    tools: Array.isArray(row.toolIds) ? row.toolIds.length : 0,
+    tools: filterEnabledToolIds(toolIds).length,
     temp: row.temperature,
   };
 }
