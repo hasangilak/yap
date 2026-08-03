@@ -11,6 +11,7 @@ import {
   readWorkspaceFile,
   runWorkspaceTests,
 } from '../../src/tools/workspace.js';
+import { executeTool } from '../../src/registry/tools.js';
 
 describe('linked workspace tools', () => {
   const root = mkdtempSync(join(tmpdir(), 'yap-workspace-'));
@@ -58,5 +59,15 @@ describe('linked workspace tools', () => {
 
   it('runs only the package test script', async () => {
     await expect(runWorkspaceTests()).resolves.toContain('workspace-tests-ok');
+  });
+
+  it('is wired through the runtime tool dispatcher', async () => {
+    await expect(executeTool('read_file', { path: 'inside.txt' })).resolves.toMatchObject({
+      status: 'ok',
+      result: 'workspace contents',
+    });
+    const tests = await executeTool('run_tests', {});
+    expect(tests.status).toBe('ok');
+    expect(tests.result).toContain('workspace-tests-ok');
   });
 });

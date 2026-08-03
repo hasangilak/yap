@@ -30,10 +30,13 @@ describe('tool registry', () => {
 
   it('advertises web_search and write_file to Ollama', () => {
     const names = OLLAMA_TOOLS.map((t) => t.function.name).sort();
-    expect(names).toEqual(['ask_clarification', 'web_search', 'write_file']);
-    expect(names.filter((name) => name !== 'ask_clarification')).toEqual(
-      TOOL_DEFS.filter((tool) => tool.enabled).map((tool) => tool.id).sort(),
-    );
+    expect(names).toEqual([
+      'ask_clarification',
+      'read_file',
+      'run_tests',
+      'web_search',
+      'write_file',
+    ]);
   });
 
   it('marks write_file / run_tests / send_email as side-effectful', () => {

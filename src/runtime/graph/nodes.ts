@@ -20,6 +20,7 @@ import {
 } from '../../db/queries.js';
 import {
   executeTool,
+  filterEnabledToolIds,
   isSideEffectful,
   TOOL_DEFS,
 } from '../../registry/tools.js';
@@ -89,6 +90,16 @@ function clarifyDataFrom(args: Record<string, unknown>): ClarifyData {
     chips: chipsRaw.map((label, i) => ({ id: `c-${i}`, label: String(label) })),
     input: String(args.input_hint ?? ''),
   };
+}
+
+function isSelectedExecutableTool(
+  state: TurnStateValue,
+  toolName: string,
+): boolean {
+  return (
+    (state.toolIds ?? []).includes(toolName) &&
+    filterEnabledToolIds([toolName]).length === 1
+  );
 }
 
 function expandAgentVariables(
@@ -414,6 +425,13 @@ export async function gateNode(
     tool_call: proposedCall,
   });
 
+  // Binding tools is the primary provider-side boundary. Keep a second
+  // server-side check because an unexpected/hallucinated tool call must not
+  // gain authority merely by reaching this node.
+  if (!isSelectedExecutableTool(state, call.name)) {
+    return { openPrompts: [], pendingApproved: true };
+  }
+
   if (await isAutoApproved(state.agentId, call.name)) {
     return { openPrompts: [], pendingApproved: true };
   }
@@ -627,7 +645,13 @@ export async function executeNode(
     tool: call.name,
   });
 
-  const exec = await executeTool(call.name, call.args);
+  const exec = isSelectedExecutableTool(state, call.name)
+    ? await executeTool(call.name, call.args)
+    : {
+        status: 'err' as const,
+        elapsed_ms: 0,
+        error: `tool '${call.name}' is unavailable or not enabled for this agent`,
+      };
   const status = exec.status === 'ok' ? 'ok' : 'err';
   const finalized: ToolCallData = {
     name: call.name,

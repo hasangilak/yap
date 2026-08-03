@@ -137,6 +137,7 @@ async function seed() {
     initial: 'M',
     description: '',
     model: 'qwen2.5:14b',
+    tool_ids: ['web_search', 'write_file'],
   });
   await insertConversation({ id: 'c-r', title: 'Runtime', agent_id: 'a-t' });
 }
@@ -273,6 +274,39 @@ describe('runtime — happy path (text only)', () => {
 });
 
 describe('runtime — tool call flow', () => {
+  it('rejects an unexpected tool call that the agent did not select', async () => {
+    await getPrisma().agent.update({
+      where: { id: 'a-t' },
+      data: { toolIds: [] },
+    });
+    CHAT_SCRIPTS.push([
+      {
+        tool_calls: [
+          {
+            function: {
+              name: 'write_file',
+              arguments: { path: 'not-allowed.txt', content: 'no' },
+            },
+          },
+        ],
+      },
+    ]);
+    CHAT_SCRIPTS.push([{ content: 'Skipped.' }]);
+
+    const events = await drain(
+      runAgent({ conversationId: 'c-r', parent: null, content: 'try it' }),
+    );
+
+    expect(events.some((event) => event.kind === 'prompt.requested')).toBe(false);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'toolcall.ended',
+        status: 'err',
+        error: "tool 'write_file' is unavailable or not enabled for this agent",
+      }),
+    );
+  });
+
   it('auto-approved web_search produces toolcall.proposed/started/ended then a second assistant round', async () => {
     CHAT_SCRIPTS.push([
       {

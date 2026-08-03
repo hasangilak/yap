@@ -71,7 +71,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
       system_prompt:
         'You are a senior code reviewer. For every diff, produce: (1) one-line summary, (2) bugs found, (3) style/idiom notes, (4) tests missing. Be direct. Ask for context only when truly blocking.',
       variables: [],
-      tool_ids: [],
+      tool_ids: ['read_file', 'run_tests'],
       permission_default: 'ask_every_time',
       message: 'Created from starter template: code-reviewer',
     },

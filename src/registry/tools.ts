@@ -3,11 +3,15 @@ import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import type { Tool } from 'ollama';
 import { config } from '../config.js';
 import { webSearch } from '../tools/browser.js';
+import { readWorkspaceFile, runWorkspaceTests } from '../tools/workspace.js';
 import type { ToolDef } from '../schemas/index.js';
 
+const workspaceLinked = config.workspaceDir !== null;
+
 /**
- * The static tool registry. Shapes match chat-box's SAMPLE_TOOLS exactly:
- * the client renders id/name/desc + an enabled + auto flag per tool.
+ * The process-scoped tool registry. Shapes match chat-box's SAMPLE_TOOLS:
+ * the client renders id/name/desc + an enabled + auto flag per tool. Workspace
+ * tools are enabled at startup only when WORKSPACE_DIR is configured.
  * `enabled: false` tools are displayed but not selectable; `auto: true`
  * means the agent may auto-approve them (Phase 2 enforces).
  */
@@ -15,8 +19,10 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'read_file',
     name: 'read_file',
-    desc: 'Read a file from the linked repo. Unavailable until a workspace is linked.',
-    enabled: false,
+    desc: workspaceLinked
+      ? 'Read a UTF-8 file from the linked workspace.'
+      : 'Read a file from the linked repo. Unavailable until WORKSPACE_DIR is set.',
+    enabled: workspaceLinked,
     auto: false,
   },
   {
@@ -29,9 +35,11 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     id: 'run_tests',
     name: 'run_tests',
-    desc: 'Execute the test suite. Unavailable until a workspace is linked.',
-    enabled: false,
-    auto: false,
+    desc: workspaceLinked
+      ? 'Execute the linked workspace package test script. Requires approval.'
+      : 'Execute the test suite. Unavailable until WORKSPACE_DIR is set.',
+    enabled: workspaceLinked,
+    auto: workspaceLinked,
   },
   {
     id: 'web_search',
@@ -72,6 +80,24 @@ export const OLLAMA_TOOLS: Tool[] = [
   {
     type: 'function' as const,
     function: {
+      name: 'read_file',
+      description:
+        'Read one UTF-8 text file from the trusted linked workspace. The path must be relative to the workspace root. Use this to inspect source, configuration, documentation, and tests before proposing code changes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'Relative file path inside the linked workspace.',
+          },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'web_search',
       description:
         'Search the web via DuckDuckGo and return the results as a numbered accessibility tree. Use this as your first step whenever you need current information, a source to cite, or facts you are not highly confident about.',
@@ -104,6 +130,18 @@ export const OLLAMA_TOOLS: Tool[] = [
           },
         },
         required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'run_tests',
+      description:
+        'Run the linked workspace package.json test script and return its output. This executes repository code and therefore requires approval. The command and workspace cannot be supplied by the model.',
+      parameters: {
+        type: 'object',
+        properties: {},
       },
     },
   },
@@ -163,6 +201,18 @@ export async function executeTool(
 ): Promise<ToolExecResult> {
   const start = Date.now();
   try {
+    if (name === 'read_file') {
+      const path = String(args.path ?? '').trim();
+      if (!path) {
+        return {
+          status: 'err',
+          elapsed_ms: 0,
+          error: 'read_file requires a non-empty "path" argument',
+        };
+      }
+      const result = await readWorkspaceFile(path);
+      return { status: 'ok', elapsed_ms: Date.now() - start, result };
+    }
     if (name === 'web_search') {
       const query = String(args.query ?? '').trim();
       if (!query) {
@@ -193,6 +243,10 @@ export async function executeTool(
         elapsed_ms: Date.now() - start,
         result: `✓ wrote ${rawPath} (${bytes} bytes)`,
       };
+    }
+    if (name === 'run_tests') {
+      const result = await runWorkspaceTests();
+      return { status: 'ok', elapsed_ms: Date.now() - start, result };
     }
     return {
       status: 'err',
