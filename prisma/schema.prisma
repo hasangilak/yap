@@ -203,6 +203,9 @@ model Prompt {
   /// double-response a 409 rather than a second resume.
   response       Json?
   respondedAt    DateTime? @map("responded_at")
+  /// Set when the owning turn is stopped before the user answers. A cancelled
+  /// prompt is terminal and must not appear in pending queries or be resumed.
+  cancelledAt    DateTime? @map("cancelled_at")
   createdAt      DateTime  @default(now()) @map("created_at")
 
   @@index([conversationId])

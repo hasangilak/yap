@@ -31,6 +31,7 @@ function serialize(row: PromptRow) {
     request: row.payload,
     response: row.response,
     responded_at: row.respondedAt?.toISOString() ?? null,
+    cancelled_at: row.cancelledAt?.toISOString() ?? null,
     created_at: row.createdAt.toISOString(),
   };
 }
@@ -59,6 +60,9 @@ promptsRouter.post('/:id/respond', async (c) => {
   const id = c.req.param('id');
   const row = await getPrompt(id);
   if (!row) return c.json({ error: 'not found' }, 404);
+  if (row.cancelledAt) {
+    return c.json({ error: 'prompt cancelled', cancelled_at: row.cancelledAt.toISOString() }, 409);
+  }
 
   // `safeParse`, not `parse`: a body that doesn't match the stored kind is a
   // client error and must be a 400. Elsewhere in the API a bare `.parse()`
@@ -106,6 +110,12 @@ promptsRouter.post('/:id/respond', async (c) => {
   const claimed = await recordPromptResponse(id, response);
   if (!claimed) {
     const current = await getPrompt(id);
+    if (current?.cancelledAt) {
+      return c.json(
+        { error: 'prompt cancelled', cancelled_at: current.cancelledAt.toISOString() },
+        409,
+      );
+    }
     return c.json(
       { error: 'already responded', response: current?.response ?? null },
       409,

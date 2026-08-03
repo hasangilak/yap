@@ -925,6 +925,7 @@ export interface PromptRow {
   payload: PromptRequest;
   response: PromptResponse | null;
   respondedAt: Date | null;
+  cancelledAt: Date | null;
   createdAt: Date;
 }
 
@@ -939,6 +940,7 @@ function rowToPrompt(row: {
   payload: Prisma.JsonValue;
   response: Prisma.JsonValue | null;
   respondedAt: Date | null;
+  cancelledAt: Date | null;
   createdAt: Date;
 }): PromptRow {
   return {
@@ -952,6 +954,7 @@ function rowToPrompt(row: {
     payload: row.payload as unknown as PromptRequest,
     response: (row.response ?? null) as unknown as PromptResponse | null,
     respondedAt: row.respondedAt,
+    cancelledAt: row.cancelledAt,
     createdAt: row.createdAt,
   };
 }
@@ -973,11 +976,31 @@ export async function listPrompts(
   const rows = await getPrisma().prompt.findMany({
     where: {
       conversationId,
-      ...(pendingOnly ? { response: { equals: Prisma.DbNull } } : {}),
+      ...(pendingOnly
+        ? { response: { equals: Prisma.DbNull }, cancelledAt: null }
+        : {}),
     },
     orderBy: { createdAt: 'desc' },
   });
   return rows.map(rowToPrompt);
+}
+
+/**
+ * End every unanswered prompt owned by a stopped turn.
+ *
+ * The update is conditional so a response that won a concurrent race remains
+ * the durable outcome; only still-unanswered prompts become cancelled.
+ */
+export async function cancelOpenPromptsForNode(nodeId: string): Promise<number> {
+  const result = await getPrisma().prompt.updateMany({
+    where: {
+      nodeId,
+      response: { equals: Prisma.DbNull },
+      cancelledAt: null,
+    },
+    data: { cancelledAt: new Date() },
+  });
+  return result.count;
 }
 
 /**
@@ -996,7 +1019,11 @@ export async function recordPromptResponse(
   response: PromptResponse,
 ): Promise<boolean> {
   const result = await getPrisma().prompt.updateMany({
-    where: { id, response: { equals: Prisma.DbNull } },
+    where: {
+      id,
+      response: { equals: Prisma.DbNull },
+      cancelledAt: null,
+    },
     data: {
       response: response as unknown as Prisma.InputJsonValue,
       respondedAt: new Date(),

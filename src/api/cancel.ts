@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import {
+  cancelOpenPromptsForNode,
   findActiveAssistantNode,
   getConversationRaw,
   requestCancel,
@@ -52,6 +53,7 @@ cancelRouter.post('/conversations/:id/cancel', async (c) => {
   }
 
   await requestCancel(active.id);
+  await cancelOpenPromptsForNode(active.id);
 
   // Ask the checkpoint, not the in-memory controller map, whether a round is
   // live. A thread sitting at an `interrupt()` has no round by definition, so

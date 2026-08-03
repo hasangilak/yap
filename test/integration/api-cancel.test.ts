@@ -7,6 +7,8 @@ import {
   insertNode,
   insertPrompt,
   isCancelRequested,
+  listPrompts,
+  getPrompt,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
 
@@ -119,7 +121,7 @@ describe('cancel vs. a late prompt response', () => {
    * an approval card is still on screen, then clicks Allow. Without the guard
    * the response would resume a turn the user had already ended.
    */
-  it('records the response but refuses to resume a cancelled turn', async () => {
+  it('cancels the prompt durably and refuses a late response', async () => {
     const nodeId = await seedLiveTurn();
     await insertPrompt({
       id: 'pr-1',
@@ -136,12 +138,14 @@ describe('cancel vs. a late prompt response', () => {
 
     await expectOk(await jsonReq(app, 'POST', '/api/v1/conversations/c-1/cancel'));
 
-    const body = (await expectOk(
-      await jsonReq(app, 'POST', '/api/v1/prompts/pr-1/respond', {
-        decision: 'allow',
-      }),
-    )) as { resumed: boolean; cancelled?: boolean };
+    const prompt = await getPrompt('pr-1');
+    expect(prompt?.cancelledAt).toBeInstanceOf(Date);
+    expect(await listPrompts('c-1', true)).toEqual([]);
 
-    expect(body).toMatchObject({ resumed: false, cancelled: true });
+    const response = await jsonReq(app, 'POST', '/api/v1/prompts/pr-1/respond', {
+      decision: 'allow',
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'prompt cancelled' });
   });
 });
