@@ -18,34 +18,6 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: yap-ollama
-    volumes:
-      - ollama-models:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-    restart: unless-stopped
-
-  # One-shot: pulls the default model into the ollama volume on first
-  # `compose up`, then exits. Re-runs on every `up` but is a no-op once
-  # the weights are cached in the volume.
-  model-init:
-    image: ollama/ollama:latest
-    container_name: yap-model-init
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["sh", "-c"]
-    command: ['ollama pull "${MODEL:-qwen2.5:14b}"']
-    restart: "no"
-
   # One-shot: syncs the Prisma schema to Postgres on every `up`.
   # Uses `prisma db push` rather than `migrate deploy` while the schema
   # is still stabilizing; a later phase swaps this for committed
@@ -67,22 +39,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
-      model-init:
-        condition: service_completed_successfully
       db-init:
         condition: service_completed_successfully
     environment:
-      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_HOST: http://host.docker.internal:11434
       MODEL: ${MODEL:-qwen2.5:14b}
       PORT: "3001"
       MAX_TOOL_ROUNDS: "8"
       DATABASE_URL: postgres://yap:yap@postgres:5432/yap
     ports:
       - "3001:3001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:
-  ollama-models:
   yap-postgres:

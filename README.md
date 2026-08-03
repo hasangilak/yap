@@ -41,11 +41,13 @@ keys, no network round-trips.
 
 ## Quick start
 
-### Docker (full stack)
+### Docker (server + database)
 
 ```bash
+# Ollama runs on the host so it can use the host GPU and model store.
+ollama pull qwen2.5:14b
 docker compose up --build
-# postgres + ollama + yap on :3001, model pull runs once
+# postgres + yap on :3001; yap connects to host Ollama on :11434
 ```
 
 ### Local dev
@@ -305,15 +307,14 @@ pnpm test:integration    # DB + API + runtime with mocked Ollama
 
 ## Containerization
 
-`docker-compose.yml` brings up the full stack:
+`docker-compose.yml` brings up the server and database. Ollama stays on
+the host so models are stored once and can use the host GPU directly:
 
 ```yaml
 services:
   postgres:       # 5432 published for pnpm dev
-  ollama:         # pulls $MODEL once into a named volume
-  model-init:     # one-shot puller, blocks yap until model is cached
   db-init:        # one-shot prisma db push, blocks yap
-  yap:            # the server, bound to 3001, depends on all three
+  yap:            # bound to 3001; connects to host.docker.internal:11434
 ```
 
 ## License
