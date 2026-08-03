@@ -7,7 +7,7 @@ export const ConversationSchema = z.object({
   snippet: z.string(),
   agent: z.string(),
   tag: z.string(),
-  tags: z.array(TagSchema),
+  tags: z.array(TagSchema).default([]),
   pinned: z.boolean().optional(),
   updated: z.string(),
   folder: z.string(),
