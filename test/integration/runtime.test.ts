@@ -108,9 +108,11 @@ import {
   insertAgent,
   insertConversation,
   insertInterjection,
+  insertNode,
   listPrompts,
   peekInterjections,
   requestCancel,
+  updateConversationPointers,
 } from '../../src/db/queries.js';
 import { getPrisma } from '../../src/db/index.js';
 import {
@@ -156,6 +158,49 @@ afterAll(async () => {
 });
 
 describe('runtime — happy path (text only)', () => {
+  it('uses a fresh branch label when posting under a node that already has children', async () => {
+    await insertNode({
+      id: 'n-root',
+      conversation_id: 'c-r',
+      parent_id: null,
+      role: 'user',
+      content: 'root',
+    });
+    await insertNode({
+      id: 'n-parent',
+      conversation_id: 'c-r',
+      parent_id: 'n-root',
+      role: 'asst',
+      content: 'answer',
+    });
+    await insertNode({
+      id: 'n-existing',
+      conversation_id: 'c-r',
+      parent_id: 'n-parent',
+      role: 'user',
+      content: 'existing branch',
+    });
+    await updateConversationPointers('c-r', {
+      root_node_id: 'n-root',
+      active_leaf_id: 'n-existing',
+    });
+    CHAT_SCRIPTS.push([{ content: 'Branched.' }]);
+
+    const events = await drain(
+      runAgent({
+        conversationId: 'c-r',
+        parent: 'n-parent',
+        content: 'alternative',
+      }),
+    );
+    const created = events
+      .filter((event) => event.kind === 'node.created')
+      .map((event) => event.node);
+
+    expect(created).toHaveLength(2);
+    expect(created.every((node) => node.branch === 'alt-1')).toBe(true);
+  });
+
   it('applies agent inference settings, selected tools, and prompt variables', async () => {
     await getPrisma().agent.update({
       where: { id: 'a-t' },

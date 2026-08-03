@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getPrisma } from '../db/index.js';
 import {
   deleteSubtree,
+  getNode,
   getConversationRaw,
   insertNode,
   listDescendantIds,
@@ -158,55 +159,40 @@ nodesRouter.post('/:id/regenerate', async (c) => {
 /**
  * POST /api/v1/nodes/:id/branch
  *
- * Spec §3.3. Creates an empty user node as a sibling of :id on a
- * fresh alt-N branch and moves active_leaf_id to it. The client's
- * composer focuses after this call so the user can fill in the text
- * themselves — no assistant reply is kicked off.
+ * Select an existing assistant node as the parent for the next user
+ * message. No placeholder is persisted: when the user sends, `runAgent`
+ * assigns a fresh alt-N label if this node already has children.
  */
 nodesRouter.post('/:id/branch', async (c) => {
   const id = c.req.param('id');
   const orig = await getPrisma().node.findUnique({ where: { id } });
   if (!orig) return c.json({ error: 'not found' }, 404);
+  if (orig.role !== 'asst') {
+    return c.json({ error: 'branches must start from an assistant node' }, 400);
+  }
 
   const conversationId = orig.conversationId;
-  const branch = await nextBranchName(conversationId);
-  const newId = newNodeId();
-
-  const newNode = await insertNode({
-    id: newId,
-    conversation_id: conversationId,
-    parent_id: orig.parentId,
-    role: 'user',
-    branch,
-    content: '',
-  });
-
-  await publish({
-    kind: 'node.created',
-    ...envelope(conversationId),
-    node: newNode,
-  });
   await updateConversationPointers(conversationId, {
-    active_leaf_id: newId,
+    active_leaf_id: id,
     updated_at: new Date(),
   });
   await publish({
     kind: 'active_leaf.changed',
     ...envelope(conversationId),
-    active_leaf_id: newId,
+    active_leaf_id: id,
   });
 
-  return c.json(newNode, 201);
+  return c.json(await getNode(id));
 });
 
 /**
  * DELETE /api/v1/nodes/:id?subtree=true[&fallback_leaf=<id>]
  *
  * Spec §3.5. Irreversibly removes the subtree rooted at :id. If the
- * conversation's active_leaf is in that subtree the caller MUST
- * provide a fallback_leaf query param so the conversation still
- * points at something reachable from the root. Returns the count of
- * nodes removed.
+ * If the conversation's active leaf is in the subtree, the nearest
+ * surviving parent becomes the fallback automatically. A caller may
+ * override it with fallback_leaf, provided that node is outside the
+ * removed subtree and belongs to the same conversation.
  */
 nodesRouter.delete('/:id', async (c) => {
   const id = c.req.param('id');
@@ -229,13 +215,10 @@ nodesRouter.delete('/:id', async (c) => {
   const rootInside =
     conv.rootNodeId != null && subtreeIds.has(conv.rootNodeId);
 
-  const fallback = c.req.query('fallback_leaf') ?? null;
-  if (activeLeafInside && !fallback) {
-    return c.json(
-      { error: 'active_leaf_id is inside the subtree; pass ?fallback_leaf=<id>' },
-      409,
-    );
-  }
+  const requestedFallback = c.req.query('fallback_leaf') ?? null;
+  const fallback = rootInside
+    ? null
+    : requestedFallback ?? (activeLeafInside ? orig.parentId : null);
   if (fallback) {
     const fb = await getPrisma().node.findUnique({ where: { id: fallback } });
     if (!fb || fb.conversationId !== conversationId || subtreeIds.has(fb.id)) {
@@ -254,16 +237,21 @@ nodesRouter.delete('/:id', async (c) => {
       root_node_id: rootInside ? null : conv.rootNodeId,
       updated_at: new Date(),
     });
-    if (activeLeafInside) {
+    if (activeLeafInside && fallback) {
       await publish({
         kind: 'active_leaf.changed',
         ...envelope(conversationId),
-        active_leaf_id: fallback!,
+        active_leaf_id: fallback,
       });
     }
   }
 
-  return c.json({ ok: true, removed });
+  return c.json({
+    ok: true,
+    removed,
+    active_leaf_id: activeLeafInside ? fallback : conv.activeLeafId,
+    root_node_id: rootInside ? null : conv.rootNodeId,
+  });
 });
 
 /**
@@ -281,4 +269,3 @@ nodesRouter.get('/:id/ripple-preview', async (c) => {
   const counts = await rippleCounts(orig.conversationId, id);
   return c.json(counts);
 });
-

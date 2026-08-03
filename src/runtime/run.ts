@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { Command } from '@langchain/langgraph';
+import { getPrisma } from '../db/index.js';
 import {
   getConversationRaw,
   insertNode,
+  nextBranchName,
   updateConversationPointers,
   walkChain,
 } from '../db/queries.js';
@@ -95,7 +97,14 @@ export async function* runAgent(input: {
   }
 
   const parentChain = parent ? await walkChain(conversationId, parent) : [];
-  const branch = parentChain[parentChain.length - 1]?.branch ?? 'main';
+  let branch = parentChain[parentChain.length - 1]?.branch ?? 'main';
+  if (parent) {
+    const existingChild = await getPrisma().node.findFirst({
+      where: { conversationId, parentId: parent },
+      select: { id: true },
+    });
+    if (existingChild) branch = await nextBranchName(conversationId);
+  }
   const userId = newNodeId();
   const userNode: MessageNode = await insertNode({
     id: userId,
