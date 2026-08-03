@@ -188,6 +188,7 @@ export async function streamModelRound(input: {
     const selected = new Set(toolIds);
     const enabledTools = OLLAMA_TOOLS.filter(
       (tool) =>
+        tool.function.name === 'web_search' ||
         tool.function.name === 'ask_clarification' ||
         selected.has(tool.function.name ?? ''),
     );

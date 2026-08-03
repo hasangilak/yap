@@ -236,6 +236,21 @@ describe('runtime — happy path (text only)', () => {
     );
   });
 
+  it('keeps web search bound when the selected agent has no tools', async () => {
+    await getPrisma().agent.update({
+      where: { id: 'a-t' },
+      data: { toolIds: [] },
+    });
+    CHAT_SCRIPTS.push([{ content: 'No search needed.' }]);
+
+    await drain(runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }));
+
+    expect(BOUND_TOOL_NAMES[0]).toEqual([
+      'web_search',
+      'ask_clarification',
+    ]);
+  });
+
   it('emits node.created(user) → active_leaf.changed → node.created(asst) → status → content × N → node.finalized → active_leaf.changed', async () => {
     CHAT_SCRIPTS.push([{ content: 'Hello ' }, { content: 'world.' }]);
     const events = await drain(

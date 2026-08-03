@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { getPrisma } from '../db/index.js';
 import {
-  firstAgentId,
+  defaultAgentId,
   getConversation,
   getConversationTree,
   insertConversation,
@@ -25,7 +25,7 @@ const ListConversationsQuerySchema = z.object({
 });
 
 async function resolveAgentId(input: string | undefined): Promise<string | null> {
-  if (!input) return firstAgentId();
+  if (!input) return defaultAgentId();
   // chat-box's Conversation.agent is a display name. Accept either a
   // real id (a-xx) or a display name — look by id first, then by name.
   const byId = await getPrisma().agent.findUnique({ where: { id: input }, select: { id: true } });

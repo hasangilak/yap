@@ -744,6 +744,20 @@ export async function firstAgentId(): Promise<string | null> {
   return row?.id ?? null;
 }
 
+/**
+ * Fresh conversations use the neutral Assistant when it exists. Falling back
+ * keeps the API usable in minimal/test databases that seed one custom agent,
+ * without making alphabetical id order a product-level choice.
+ */
+export async function defaultAgentId(): Promise<string | null> {
+  const assistant = await getPrisma().agent.findFirst({
+    where: { name: 'Assistant', deletedAt: null },
+    orderBy: { id: 'asc' },
+    select: { id: true },
+  });
+  return assistant?.id ?? firstAgentId();
+}
+
 // -- events -------------------------------------------------------------------
 
 export async function insertEvent(ev: BusEvent): Promise<void> {

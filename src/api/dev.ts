@@ -34,6 +34,10 @@ devRouter.post('/seed', async (c) => {
       description: a.desc,
       model: a.model,
       temperature: a.temp,
+      tool_ids:
+        a.name === 'Assistant' || a.name === 'Researcher'
+          ? ['web_search']
+          : [],
     });
   }
 

@@ -117,13 +117,35 @@ describe('POST /api/v1/conversations', () => {
     expect(res.status).toBe(400);
   });
 
-  it('creates a conversation tied to the first agent when agent is omitted', async () => {
+  it('falls back to the only agent when Assistant is not seeded', async () => {
     await seed();
     const body = (await expectOk(
       await jsonReq(app, 'POST', '/api/v1/conversations', { title: 'x' }),
     )) as { id: string; agent: string };
     expect(body.id).toMatch(/^c-/);
     expect(body.agent).toBe('Tester');
+  });
+
+  it('defaults to the neutral Assistant rather than the first agent id', async () => {
+    await insertAgent({
+      id: 'a-01',
+      name: 'Code Reviewer',
+      initial: 'C',
+      description: '',
+      model: 'qwen2.5:14b',
+    });
+    await insertAgent({
+      id: 'a-99',
+      name: 'Assistant',
+      initial: 'A',
+      description: '',
+      model: 'qwen2.5:14b',
+    });
+
+    const body = (await expectOk(
+      await jsonReq(app, 'POST', '/api/v1/conversations', {}),
+    )) as { agent: string };
+    expect(body.agent).toBe('Assistant');
   });
 
   it('accepts agent by display name and resolves to agent_id', async () => {
