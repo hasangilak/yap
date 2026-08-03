@@ -131,12 +131,25 @@ function isAbortError(err: unknown): boolean {
  */
 export async function streamModelRound(input: {
   model: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+  toolIds: string[];
   messages: TurnMessage[];
   /** Caller-owned signal (mid-turn steering). Never the HTTP request's. */
   signal?: AbortSignal;
   onSegment: (seg: Segment) => void;
 }): Promise<ModelRoundResult> {
-  const { model, messages, signal, onSegment } = input;
+  const {
+    model,
+    temperature,
+    topP,
+    maxTokens,
+    toolIds,
+    messages,
+    signal,
+    onSegment,
+  } = input;
 
   const splitter = new ThinkSplitter();
   const reasoningBuffer: string[] = [];
@@ -165,8 +178,20 @@ export async function streamModelRound(input: {
     : deadline.signal;
 
   try {
-    const llm = new ChatOllama({ model, baseUrl: config.ollamaHost });
-    const withTools = llm.bindTools(OLLAMA_TOOLS as never);
+    const llm = new ChatOllama({
+      model,
+      baseUrl: config.ollamaHost,
+      temperature,
+      topP,
+      numPredict: maxTokens,
+    });
+    const selected = new Set(toolIds);
+    const enabledTools = OLLAMA_TOOLS.filter(
+      (tool) =>
+        tool.function.name === 'ask_clarification' ||
+        selected.has(tool.function.name ?? ''),
+    );
+    const withTools = llm.bindTools(enabledTools as never);
     const stream = await withTools.stream(toLangChainMessages(messages), {
       signal: combined,
     });

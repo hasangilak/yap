@@ -12,7 +12,13 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
  * `AIMessageChunk.concat()` to reassemble and parse them, so faking the parsed
  * shape would test a code path that never runs in production.
  */
-const { CHAT_SCRIPTS, STREAM_CALLS, MID_STREAM } = vi.hoisted(() => ({
+const {
+  CHAT_SCRIPTS,
+  STREAM_CALLS,
+  MODEL_OPTIONS,
+  BOUND_TOOL_NAMES,
+  MID_STREAM,
+} = vi.hoisted(() => ({
   CHAT_SCRIPTS: [] as Array<
     Array<{
       content?: string;
@@ -22,6 +28,8 @@ const { CHAT_SCRIPTS, STREAM_CALLS, MID_STREAM } = vi.hoisted(() => ({
     }>
   >,
   STREAM_CALLS: [] as Array<Record<string, unknown>>,
+  MODEL_OPTIONS: [] as Array<Record<string, unknown>>,
+  BOUND_TOOL_NAMES: [] as string[][],
   /**
    * One optional hook per model round, run after the round's first chunk.
    *
@@ -35,9 +43,12 @@ const { CHAT_SCRIPTS, STREAM_CALLS, MID_STREAM } = vi.hoisted(() => ({
 vi.mock('@langchain/ollama', async () => {
   const { AIMessageChunk } = await import('@langchain/core/messages');
   class ChatOllama {
-    constructor(public opts: Record<string, unknown>) {}
+    constructor(public opts: Record<string, unknown>) {
+      MODEL_OPTIONS.push(opts);
+    }
 
-    bindTools() {
+    bindTools(tools: Array<{ function: { name: string } }>) {
+      BOUND_TOOL_NAMES.push(tools.map((tool) => tool.function.name));
       return {
         stream: async (
           messages: unknown,
@@ -131,6 +142,8 @@ async function seed() {
 beforeEach(async () => {
   CHAT_SCRIPTS.length = 0;
   STREAM_CALLS.length = 0;
+  MODEL_OPTIONS.length = 0;
+  BOUND_TOOL_NAMES.length = 0;
   MID_STREAM.length = 0;
   await setupCheckpointer();
   await truncateAll();
@@ -143,6 +156,40 @@ afterAll(async () => {
 });
 
 describe('runtime — happy path (text only)', () => {
+  it('applies agent inference settings, selected tools, and prompt variables', async () => {
+    await getPrisma().agent.update({
+      where: { id: 'a-t' },
+      data: {
+        temperature: 0.17,
+        topP: 0.61,
+        maxTokens: 321,
+        toolIds: ['web_search'],
+        systemPrompt: 'Help {{audience}}. Do not expand {{missing}}.',
+        variables: [
+          { name: 'audience', default: 'operators', description: '' },
+        ],
+      },
+    });
+    CHAT_SCRIPTS.push([{ content: 'Configured.' }]);
+
+    await drain(runAgent({ conversationId: 'c-r', parent: null, content: 'hi' }));
+
+    expect(MODEL_OPTIONS[0]).toMatchObject({
+      model: 'qwen2.5:14b',
+      temperature: 0.17,
+      topP: 0.61,
+      numPredict: 321,
+    });
+    expect(BOUND_TOOL_NAMES[0]).toEqual([
+      'web_search',
+      'ask_clarification',
+    ]);
+    const messages = STREAM_CALLS[0]!.messages as Array<{ content: unknown }>;
+    expect(messages[0]!.content).toBe(
+      'Help operators. Do not expand {{missing}}.',
+    );
+  });
+
   it('emits node.created(user) → active_leaf.changed → node.created(asst) → status → content × N → node.finalized → active_leaf.changed', async () => {
     CHAT_SCRIPTS.push([{ content: 'Hello ' }, { content: 'world.' }]);
     const events = await drain(

@@ -66,6 +66,11 @@ export const TurnState = new StateSchema({
   parentUserNodeId: z.string(),
   branch: z.string(),
   model: z.string(),
+  /** Agent sampling/tool configuration captured when the turn starts. */
+  temperature: z.number().optional(),
+  topP: z.number().optional(),
+  maxTokens: z.number().int().positive().optional(),
+  toolIds: z.array(z.string()).optional(),
   /** Wall-clock start, so `elapsed_ms` on status events survives a resume. */
   runStartedAt: z.number().int(),
 

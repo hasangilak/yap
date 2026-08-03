@@ -642,6 +642,7 @@ type AgentRow = {
   maxTokens: number;
   systemPrompt: string;
   toolIds: Prisma.JsonValue;
+  variables: Prisma.JsonValue;
 };
 
 function agentRowToWire(row: AgentRow): Agent {

@@ -91,6 +91,28 @@ function clarifyDataFrom(args: Record<string, unknown>): ClarifyData {
   };
 }
 
+function expandAgentVariables(
+  prompt: string,
+  value: unknown,
+): string {
+  if (!Array.isArray(value)) return prompt;
+  return value.reduce((expanded, variable) => {
+    if (
+      !variable ||
+      typeof variable !== 'object' ||
+      !('name' in variable) ||
+      typeof variable.name !== 'string'
+    ) {
+      return expanded;
+    }
+    const replacement =
+      'default' in variable && typeof variable.default === 'string'
+        ? variable.default
+        : '';
+    return expanded.split(`{{${variable.name}}}`).join(replacement);
+  }, prompt);
+}
+
 // -- prepare -----------------------------------------------------------------
 
 /**
@@ -129,10 +151,14 @@ export async function prepareNode(
 
   const agent = await getAgentRaw(conv.agentId);
   const model = agent?.model ?? config.defaultModel;
-  const systemPrompt =
+  const systemPromptTemplate =
     agent?.systemPrompt && agent.systemPrompt.trim()
       ? agent.systemPrompt
       : DEFAULT_SYSTEM_PROMPT;
+  const systemPrompt = expandAgentVariables(
+    systemPromptTemplate,
+    agent?.variables,
+  );
 
   const asstNode = await insertNode({
     id: asstNodeId,
@@ -163,7 +189,18 @@ export async function prepareNode(
     })),
   ];
 
-  return { agentId: conv.agentId, model, messages, done: false };
+  return {
+    agentId: conv.agentId,
+    model,
+    temperature: agent?.temperature ?? 0.5,
+    topP: agent?.topP ?? 1,
+    maxTokens: agent?.maxTokens ?? 4096,
+    toolIds: Array.isArray(agent?.toolIds)
+      ? agent.toolIds.filter((id): id is string => typeof id === 'string')
+      : [],
+    messages,
+    done: false,
+  };
 }
 
 // -- callModel ---------------------------------------------------------------
@@ -189,6 +226,10 @@ export async function callModelNode(
   const ac = takeAbortController(asstNodeId);
   const result = await streamModelRound({
     model: state.model,
+    temperature: state.temperature ?? 0.5,
+    topP: state.topP ?? 1,
+    maxTokens: state.maxTokens ?? 4096,
+    toolIds: state.toolIds ?? [],
     messages: [...state.messages, ...injected],
     signal: ac.signal,
     onSegment: (seg) => {
