@@ -97,7 +97,7 @@ function isSelectedExecutableTool(
   toolName: string,
 ): boolean {
   return (
-    (state.toolIds ?? []).includes(toolName) &&
+    (toolName === 'web_search' || (state.toolIds ?? []).includes(toolName)) &&
     filterEnabledToolIds([toolName]).length === 1
   );
 }

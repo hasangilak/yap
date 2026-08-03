@@ -112,6 +112,60 @@ function normalizeToolCalls(acc: AIMessageChunk | undefined): NormalizedToolCall
   }));
 }
 
+/**
+ * Some Ollama models serialize a requested web search into assistant text even
+ * when function schemas are bound. Recognize only the read-only, always-on
+ * search tool; never promote textual requests for side-effectful tools.
+ */
+export function parseTextualWebSearchCall(content: string): NormalizedToolCall | null {
+  const functionCall = content.match(
+    /web_search\s*\(\s*("(?:\\.|[^"\\])*"|'[^']*')\s*\)\s*;?\s*$/s,
+  );
+  if (functionCall?.[1]) {
+    const quoted = functionCall[1];
+    const query = quoted.startsWith('"')
+      ? String(JSON.parse(quoted))
+      : quoted.slice(1, -1);
+    if (query.trim()) return { name: 'web_search', args: { query: query.trim() } };
+  }
+
+  for (let start = 0; start < content.length; start++) {
+    if (content[start] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let end = start; end < content.length; end++) {
+      const char = content[end]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') inString = true;
+      else if (char === '{') depth++;
+      else if (char === '}') depth--;
+      if (depth !== 0) continue;
+
+      try {
+        const parsed = JSON.parse(content.slice(start, end + 1)) as {
+          name?: unknown;
+          arguments?: { query?: unknown };
+        };
+        const query = parsed.arguments?.query;
+        if (parsed.name === 'web_search' && typeof query === 'string' && query.trim()) {
+          return { name: 'web_search', args: { query: query.trim() } };
+        }
+      } catch {
+        // Not a complete JSON tool envelope; continue scanning later objects.
+      }
+      break;
+    }
+  }
+
+  return null;
+}
+
 function isAbortError(err: unknown): boolean {
   return (
     err instanceof Error &&
@@ -203,7 +257,17 @@ export async function streamModelRound(input: {
       if (text) handle(splitter.feed(text));
     }
     handle(splitter.flush());
-    return { roundContent, reasoningSteps, toolCalls: normalizeToolCalls(acc) };
+    const structuredToolCalls = normalizeToolCalls(acc);
+    const textualSearch =
+      structuredToolCalls.length === 0 ? parseTextualWebSearchCall(roundContent) : null;
+    return {
+      // The streamed pseudo-call is removed from persisted history. The client
+      // also hides it as soon as toolcall.proposed arrives, replacing it with
+      // the real search card.
+      roundContent: textualSearch ? '' : roundContent,
+      reasoningSteps,
+      toolCalls: textualSearch ? [textualSearch] : structuredToolCalls,
+    };
   } catch (err) {
     if (!isAbortError(err)) throw err;
     // Keep whatever the splitter was holding so partial output is not lost.
