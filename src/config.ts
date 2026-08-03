@@ -14,6 +14,20 @@ export const config = {
     ?? 'postgres://yap:yap@localhost:5432/yap',
   artifactsDir:
     process.env.ARTIFACTS_DIR ?? resolve(projectRoot, '../artifacts'),
+  /// Optional trusted project root exposed to read_file/run_tests. Tool
+  /// arguments can never replace this root; unset means no workspace tools.
+  workspaceDir: process.env.WORKSPACE_DIR
+    ? resolve(process.env.WORKSPACE_DIR)
+    : null,
+  workspaceReadMaxBytes: Number(
+    process.env.WORKSPACE_READ_MAX_BYTES ?? 200_000,
+  ),
+  workspaceTestTimeoutMs: Number(
+    process.env.WORKSPACE_TEST_TIMEOUT_MS ?? 120_000,
+  ),
+  workspaceTestMaxOutputBytes: Number(
+    process.env.WORKSPACE_TEST_MAX_OUTPUT_BYTES ?? 200_000,
+  ),
   /// Optional bearer token required on /api/v1/*. Unset = open mode.
   apiToken: process.env.YAP_API_TOKEN ?? '',
   /// Per-tool-call deadline in ms. Overridden per-agent later (Phase 4+).
